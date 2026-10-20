@@ -34,16 +34,137 @@ Extras:
   --offline        LAN-only mode: no internet at all; local channels from the saved list
   --tablo-ip ADDR  your Tablo's address if it changed (e.g. 192.168.1.50)
   --direct         never use ffmpeg, even if it's installed
+  --encoder NAME   phone/TV video encoder: auto (graphics chip if possible), x264, ...
   --port N         use a different local port (default 8000)
   --debug          show detailed messages on screen
 """
 
+# =============================================================================
+# HOW THIS FILE IS ORGANIZED (top to bottom)
+# Each part starts with a "SECTION n" banner: search for "SECTION 7" to jump there.
+# =============================================================================
+#  1. Platform helpers      Windows/Linux differences, colors, launching apps
+#  2. Settings             the S object, tablo.ini, tablo-cache.json, the log
+#  3. Log scrubbing         tokens/passwords replaced by [token:xxxx] in logs
+#  4. Tablo API             cloud login, channel list, TV guide, tuning on your
+#                           home network (signed requests), freeing tuners,
+#                           offline fallback (class Tablo)
+#  5. Favorites             the 'favorites =' line in tablo.ini
+#  6. TV guide + playlists  /guide.xml (XMLTV, prebuilt in the background) and
+#                           /tv.m3u for IPTV apps
+#  7. Browser/TV playback   ffmpeg converts the Tablo stream to H.264 for phones,
+#                           TVs and Cast (class LiveTV), on the graphics chip
+#                           when possible (ENCODERS, choose_encoder)
+#  8. Web pages             main page (phones/PC) and the /tv page (TV remotes)
+#  9. Web server            every URL other devices use (make_handler)
+# 10. Players + commands    --setup, VLC commands, finding VLC/Flatpak/ffplay/
+#                           mpv; one reusable VLC window controlled through
+#                           VLC's local web remote
+# 11. Terminal menu         channel list in columns, colors, details view
+# 12. main()                command-line options and startup, split into steps
+#                           (load_login, connect_tablo, serve...); the
+#                           password keyring helpers live here too
+# Settings for this run live in one object, S (class Settings).
+# Tests: tests/ (python3 -m pytest), with a fake Tablo; no account needed.
+#
+# How a channel plays in VLC:  menu pick -> VLC opens http://127.0.0.1:8000/ch/<id>
+#   -> our server asks the Tablo to tune (signed POST .../watch) -> the Tablo
+#   returns a stream URL -> VLC is redirected there (or ffmpeg relays it).
+# How it plays on a phone/TV:  /live/<id>/index.m3u8 -> ffmpeg converts the
+#   stream to H.264/AAC HLS in a temp folder -> the device plays those segments.
+#
+# Security notes: tablo.ini holds your password (file is mode 0600); tokens are
+# scrubbed from logs; with --lan, set access_key in tablo.ini to require a key.
+#
+# -----------------------------------------------------------------------------
+# WORDS USED IN THIS FILE
+# -----------------------------------------------------------------------------
+#  OTA            Over-the-air: local broadcast channels from your antenna,
+#                 tuned by the Tablo box. Numbered like 9.1 (major.minor).
+#  FAST / OTT     Free ad-supported streaming channels (Pluto, Xumo...) that the
+#                 Tablo app lists. They come from the internet, not the antenna,
+#                 so they don't use a tuner. In code: Channel.kind == "ott".
+#  Channel id     Tablo's own text identifier for a channel (not 9.1). Used
+#                 in every URL: /ch/<id>, /live/<id>/...
+#  Tuner          The Tablo has a few. Each OTA channel being watched (or
+#                 recorded) holds one until its session is ended.
+#  Session token  What the Tablo returns when it tunes. We send it back
+#                 (DELETE /player/sessions/<token>) to free the tuner.
+#  Cloud          Tablo's internet service (lighthousetv.ewscloud.com): login,
+#                 channel list, TV guide. Tuning itself is done by the box on
+#                 your home network (device_url).
+#  Lighthouse/lh  Tablo's name for the token that picks your account + box in
+#                 cloud requests (self.lh_token). "?lh" on local requests too.
+#  Signing keys   hash_key/device_key: fixed values from the Tablo app, used to
+#                 sign requests to the box (device_auth). Public, not secret.
+#  HLS / .m3u8    HTTP Live Streaming: a small playlist file that lists 2-6 s
+#                 video files (.ts segments). The Tablo, phones and TVs speak it.
+#  .m3u           A playlist of channels (VLC, IPTV apps).
+#  XMLTV          The standard TV-guide file format IPTV apps read (/guide.xml).
+#  Converting     The Tablo sends the raw broadcast (usually MPEG-2 video, AC-3
+#  (transcoding)  audio). VLC plays that, phone/TV browsers don't, so ffmpeg
+#                 re-encodes it to H.264 + AAC for them (SECTION 7).
+#  Viewer         A device watching through our server, known by its IP address.
+#
+# -----------------------------------------------------------------------------
+# WHAT RUNS AT THE SAME TIME (threads)
+# -----------------------------------------------------------------------------
+#  Main thread      the terminal menu (or just waits, with --no-vlc).
+#  Web server       one short-lived thread per web request (ThreadingHTTPServer),
+#                   so many devices can be served at once.
+#  LiveTV reaper    stops converters nobody has watched for 45 s.
+#  Guide refresher  rebuilds /guide.xml every 30 min (--lan only).
+#  Log readers      one per ffmpeg, copying its error output into the log.
+#  Shared data is guarded by locks: Tablo.lock (cloud data), LiveTV.lock (the
+#  converters), _xmltv_lock (the guide). Rule: never do slow work (tuning,
+#  starting ffmpeg, network calls) while holding a lock, so one slow device
+#  can't freeze the others.
+#
+# -----------------------------------------------------------------------------
+# WHERE TO CHANGE COMMON THINGS
+# -----------------------------------------------------------------------------
+#  Default port 8000 ................ DEFAULT_PORT
+#  Default VLC buffer (3 s) ......... DEFAULT_VLC_BUFFER (or vlc_buffer in tablo.ini;
+#                                     10000 = 10 s if Wi-Fi hiccups cause stutters)
+#  A new tablo.ini setting .......... CONFIG_HEADER (document it), save_config
+#                                     (default), apply_playback_settings (read
+#                                     it into S), class Settings (store it)
+#  A new command-line option ........ build_parser, then use args.<name>
+#  A new web address (URL) .......... Handler.do_GET in make_handler
+#  A new video player ............... resolve_player / launch_player
+#  A new GPU encoder ................ ENCODERS and AUTO_ORDER
+#  Menu colors ...................... LIGHT_BLUE, HEAD, WARN, DIM (SECTION 11)
+#  Phone/TV picture quality ......... browser_quality / tv_quality in tablo.ini
+#  Web page look .................... PAGE and TV_PAGE (HTML/CSS/JS templates)
+#
+# -----------------------------------------------------------------------------
+# CONVENTIONS
+# -----------------------------------------------------------------------------
+#  * Python standard library only, so there's nothing to pip install. Optional
+#    extras (keyring, tablo-api) are imported inside try/except.
+#  * Outside programs (ffmpeg, VLC, ffplay, mpv, secret-tool) are found with
+#    shutil.which and started with subprocess; never through a shell, so
+#    channel names can't inject commands.
+#  * Messages go through log (screen + tablo-vlc.log). print() is only for the
+#    menu and lists meant for the screen. Anything secret is registered with
+#    register_secret() so the log shows [token:xxxx] instead.
+#  * Network calls go through http(), which retries and raises NetworkError
+#    (can't connect) or HTTPStatusError (the server said no), so callers can
+#    tell "offline" apart from "wrong password".
+#  * Web pages are plain strings with %%NAME%% placeholders filled by fill();
+#    there's no template library.
+#  * Works on Linux and Windows 11: platform differences are kept in small
+#    helpers (IS_WINDOWS, spawn, clock, find_windows_vlc, find_flatpak_vlc).
+# =============================================================================
+
+# Standard library only (see CONVENTIONS above).
 import argparse
 import configparser
 import getpass
 import hashlib
 import hmac
 import html
+from http.cookies import SimpleCookie
 import json
 import logging
 import logging.handlers
@@ -72,6 +193,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 
+# =============================================================================
+# SECTION 1: PLATFORM HELPERS
+# Small differences between Linux and Windows, kept in one place.
+# =============================================================================
 IS_WINDOWS = os.name == "nt"
 # How to run this script, for help text: Windows uses the py launcher.
 RUN = "py tablo-vlc.py" if IS_WINDOWS else "./tablo-vlc.py"
@@ -115,25 +240,67 @@ def clock(dt) -> str:
     return dt.astimezone().strftime("%I:%M %p").lstrip("0")
 
 
+# =============================================================================
+# SECTION 2: SETTINGS
+# S (this run's settings), tablo.ini, and the log file.
+# =============================================================================
+DEFAULT_PORT = 8000
+# VLC live buffer in ms (3 s): quick to start and change channels. If VLC stutters
+# on Wi-Fi hiccups, raise it to 10000 (10 s) with vlc_buffer in tablo.ini or
+# --buffer 10000, rather than changing it here.
+DEFAULT_VLC_BUFFER = 3000
+
+
+class Settings:
+    """Everything the command line and tablo.ini decide, in one place.
+    Set once at startup (main) and read everywhere as S.<name>."""
+    def __init__(self):
+        self.use_ffmpeg = False          # ffmpeg can relay streams to VLC (--direct turns off)
+        self.player = None               # chosen video player: resolve_player()
+        self.last_ffplay = None          # ffplay window we opened (closed when switching)
+        self.vlc_buffer_ms = DEFAULT_VLC_BUFFER   # VLC live buffer, ms (tablo.ini vlc_buffer, --buffer)
+        self.deinterlace = "yadif2x"     # VLC deinterlace mode; "off" = none
+        self.browser_quality = 720       # phones/tablets picture height (browser_quality)
+        self.tv_quality = 1080           # TVs / Cast / IPTV apps picture height (tv_quality)
+        self.encoder_setting = "auto"    # tablo.ini encoder: auto, x264, vaapi, nvenc, qsv, amf
+        self.encoder = None              # encoder actually used (found on first use)
+        self.lan_base = ""               # "http://<this PC's IP>:<port>" with --lan (for Cast)
+        self.access_key = ""             # tablo.ini access_key: other devices need ?key=...
+        self.columns = 0                 # menu columns; 0 = fit the window (--columns)
+        self.use_color = (sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+                          and enable_windows_ansi())   # --no-color turns off
+        self.console = None              # the on-screen log handler (quieted during the menu)
+        self.hash_key = ""               # Tablo app signing keys (tablo.ini / downloaded)
+        self.device_key = ""
+
+
+S = Settings()
+
+
 # Config lives next to this script: same folder as tablo-vlc.py
 CONFIG_FILE = Path(__file__).resolve().parent / "tablo.ini"
 LOG_FILE = Path(__file__).resolve().parent / "tablo-vlc.log"
 # Saved copy of your Tablo's address + channel list (+ last guide info) so the
 # script still starts and plays local channels when the internet is down.
 CACHE_FILE = Path(__file__).resolve().parent / "tablo-cache.json"
-DEFAULT_PORT = 8000
-USE_FFMPEG = False  # set in main()
 
 CONFIG_HEADER = """\
 # tablo-vlc settings. Edit with any text editor.
-#   email / password : your Tablo account login
+#   email / password : your Tablo account login. password = keyring keeps the real
+#                      password in your desktop keyring instead (--setup offers it)
 #   favorites        : channels to list first, e.g. 4.1, 9.1, KFOR (or use --add-fav / --remove-fav)
 #   port             : local port for the playlist server
 #   device           : (optional) Tablo name, if your account has more than one
-#   vlc_buffer       : VLC buffer for live TV in milliseconds (default 3000; more = smoother, slower start)
+#   vlc_buffer       : VLC buffer for live TV in milliseconds (default 3000 = 3 seconds).
+#                      If VLC stutters on Wi-Fi hiccups, try 10000 (10 seconds): smoother,
+#                      but channels take a few seconds longer to start and to change.
 #   deinterlace      : VLC deinterlace mode for 1080i broadcasts: yadif2x (default), yadif, bob, off
 #   browser_quality  : max picture height when watching in a phone/tablet browser: 480, 720 (default), 1080
 #   tv_quality       : max picture height for TVs, Cast and IPTV apps: 720, 1080 (default)
+#   encoder          : video encoder for phones/TVs: auto (default: uses your graphics
+#                      chip if it can), x264 (software), vaapi, nvenc, qsv, amf
+#   access_key       : (optional) with --lan, other devices must use this key, e.g.
+#                      http://<PC-IP>:8000/?key=YOURKEY  (blank = anyone on your Wi-Fi)
 #   player           : (optional) video player: vlc, flatpak (Flatpak VLC), ffplay, mpv,
 #                      or a full command. Blank = VLC (regular, Snap or Flatpak), else ffplay.
 #   hash_key / device_key : Tablo app signing keys (needed to tune channels).
@@ -144,31 +311,82 @@ CONFIG_HEADER = """\
 """
 
 
-# ----------------------------------------------------------------------
-# Logging: console + tablo-vlc.log next to the script (rotates at 1 MB,
-# keeps 3 old files). Your password is never logged.
-# ----------------------------------------------------------------------
+# =============================================================================
+# SECTION 3: LOGGING AND SECRET SCRUBBING
+# Console + tablo-vlc.log next to the script (rotates at 1 MB, keeps 3 old
+# files). Tokens, the password and the access key are replaced by [token:xxxx].
+# =============================================================================
 log = logging.getLogger("tablo-vlc")
-CONSOLE: logging.Handler | None = None
 
 
-def setup_logging(debug: bool = False) -> None:
+# --- Secret scrubbing --------------------------------------------------------
+# Logs get pasted into forums and GitHub issues, so tokens never reach the log
+# file or screen. Each secret is replaced by a short fingerprint such as
+# [token:a91f]: the same token always gets the same fingerprint (so you can
+# still follow one session, or see when it changed), but it can't be reused.
+# --debug-raw turns this off for hands-on troubleshooting.
+_SECRETS: set = set()
+_SECRET_PATTERNS = [
+    re.compile(r"(Bearer\s+)([A-Za-z0-9._~+/=-]{12,})"),
+    re.compile(r"(tablo:[A-Za-z0-9]+:)([0-9a-f]{32})"),                     # signed device auth
+    re.compile(r"([?&](?:token|auth|key|sig|signature|session|lh_token)[^=&\s]*=)([^&\s\"']+)", re.I),
+    re.compile(r"(/player/sessions/)([^/?\s]+)"),                           # Tablo stream session
+]
+
+
+def fingerprint(secret: str) -> str:
+    """Short, stable stand-in for a secret: same input, same 4 hex digits."""
+    return "[token:" + hashlib.sha256(secret.encode()).hexdigest()[:4] + "]"
+
+
+def register_secret(value) -> None:
+    """Remember a secret (login token, session token, password) for scrubbing."""
+    if value and isinstance(value, str) and len(value) >= 6:
+        _SECRETS.add(value)
+
+
+def scrub(text: str) -> str:
+    """Replace every known secret, and anything token-shaped, with a fingerprint."""
+    for secret in sorted(_SECRETS, key=len, reverse=True):     # longest first
+        if secret in text:
+            text = text.replace(secret, fingerprint(secret))
+    for pat in _SECRET_PATTERNS:
+        text = pat.sub(lambda m: m.group(1) + (m.group(2) if m.group(2).startswith("[token:")
+                                               else fingerprint(m.group(2))), text)
+    return text
+
+
+class ScrubFilter(logging.Filter):
+    """Logging filter that scrubs secrets from every message before it's written."""
+    def filter(self, record: logging.LogRecord) -> bool:
+        """Rewrite the message with secrets scrubbed; always lets the record through."""
+        record.msg = scrub(record.getMessage())
+        record.args = None
+        return True
+
+
+def setup_logging(debug: bool = False, raw: bool = False) -> None:
+    """Log to the screen (INFO, or DEBUG with --debug) and to tablo-vlc.log
+    (always DEBUG, rotated at 1 MB, 3 old copies). raw=True skips token scrubbing."""
     log.setLevel(logging.DEBUG)
     fh = logging.handlers.RotatingFileHandler(LOG_FILE, maxBytes=1_000_000, backupCount=3, encoding="utf-8")
     fh.setLevel(logging.DEBUG)
     fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)-7s %(message)s"))
-    global CONSOLE
-    ch = CONSOLE = logging.StreamHandler(sys.stdout)
+    ch = S.console = logging.StreamHandler(sys.stdout)
     ch.setLevel(logging.DEBUG if debug else logging.INFO)
     ch.setFormatter(logging.Formatter("%(message)s"))
     log.addHandler(fh)
     log.addHandler(ch)
+    if not raw:
+        log.addFilter(ScrubFilter())
 
 
 # ----------------------------------------------------------------------
 # Config
 # ----------------------------------------------------------------------
 def load_config() -> configparser.ConfigParser:
+    """Read tablo.ini (next to the script). Missing file = empty [tablo] section.
+    interpolation=None so passwords may contain % signs."""
     cfg = configparser.ConfigParser(interpolation=None)  # allow % in passwords
     if CONFIG_FILE.exists():
         cfg.read(CONFIG_FILE, encoding="utf-8")
@@ -178,10 +396,12 @@ def load_config() -> configparser.ConfigParser:
 
 
 def save_config(cfg: configparser.ConfigParser) -> None:
+    """Write tablo.ini with the explanatory header, readable only by you (0600).
+    Fills in any missing setting names with their defaults so they're discoverable."""
     t = cfg["tablo"]
     for key, default in (("email", ""), ("password", ""), ("favorites", ""),
-                         ("port", str(DEFAULT_PORT)), ("player", ""), ("vlc_buffer", "3000"),
-                         ("deinterlace", "yadif2x"), ("browser_quality", "720"), ("tv_quality", "1080"), ("hash_key", ""), ("device_key", "")):
+                         ("port", str(DEFAULT_PORT)), ("player", ""), ("vlc_buffer", str(DEFAULT_VLC_BUFFER)),
+                         ("deinterlace", "yadif2x"), ("browser_quality", "720"), ("tv_quality", "1080"), ("encoder", "auto"), ("access_key", ""), ("hash_key", ""), ("device_key", "")):
         t.setdefault(key, default)
     fd = os.open(CONFIG_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -190,19 +410,27 @@ def save_config(cfg: configparser.ConfigParser) -> None:
     os.chmod(CONFIG_FILE, 0o600)  # only you can read it
 
 
-# ----------------------------------------------------------------------
-# Tablo 4th Gen API (standard library only)
-#   Login flow and HMAC-MD5 request signing as documented by the
-#   tablo-api (trevor-viljoen) and tablo2plex projects. The two signing keys
-#   are static values embedded in the official Tablo app; they are NOT in
-#   this file. Put them in tablo.ini (hash_key / device_key), or install the
-#   tablo-api package and they're read from there.
-# ----------------------------------------------------------------------
+# =============================================================================
+# SECTION 4: TABLO API (cloud + the box on your network)
+# Login flow and HMAC-MD5 request signing as documented by the tablo-api
+# (trevor-viljoen) and tablo2plex projects. The two signing keys are fixed
+# values from the official Tablo app; they are NOT in this file. They're read
+# from tablo.ini (hash_key / device_key), downloaded from GitHub on first run
+# (fetch_keys), or taken from the tablo-api package if it's installed.
+# 
+# Request map:
+#   cloud  POST /api/v2/login/                       email+password -> access token
+#   cloud  GET  /api/v2/account/                     your Tablo box(es) + profile
+#   cloud  POST /api/v2/account/select/              pick box+profile -> lh token
+#   cloud  GET  /api/v2/account/<lh>/guide/channels/       channel list
+#   cloud  GET  /api/v2/account/<lh>/guide/channels/live/  what's on now
+#   cloud  GET  /api/v2/account/guide/channels/<id>/airings/<date>/  schedule
+#   box    POST /guide/channels/<id>/watch?lh       tune (signed) -> stream URL
+#   box    DELETE /player/sessions/<token>?lh       free the tuner (signed)
+# =============================================================================
 CLOUD = "https://lighthousetv.ewscloud.com"
 CLOUD_UA = "Tablo-FAST/2.0.0 (Mobile; iPhone; iOS 16.6)"
 LOCAL_UA = "Tablo-FAST/1.7.0 (Mobile; iPhone; iOS 18.4)"
-HASH_KEY = ""    # loaded by load_keys()
-DEVICE_KEY = ""
 
 
 KEY_SOURCES = [
@@ -238,18 +466,17 @@ def fetch_keys(cfg) -> bool:
 
 def load_keys(t) -> bool:
     """Signing keys from tablo.ini, else from the tablo-api package if installed."""
-    global HASH_KEY, DEVICE_KEY
-    HASH_KEY = t.get("hash_key", "").strip().strip('"')
-    DEVICE_KEY = t.get("device_key", "").strip().strip('"')
-    if not (HASH_KEY and DEVICE_KEY):
+    S.hash_key = t.get("hash_key", "").strip().strip('"')
+    S.device_key = t.get("device_key", "").strip().strip('"')
+    if not (S.hash_key and S.device_key):
         try:
             from tablo_api import auth as _ta  # optional: pip install tablo-api
-            HASH_KEY = HASH_KEY or _ta._HASH_KEY
-            DEVICE_KEY = DEVICE_KEY or _ta._DEVICE_KEY
+            S.hash_key = S.hash_key or _ta._HASH_KEY
+            S.device_key = S.device_key or _ta._DEVICE_KEY
             log.debug("Signing keys loaded from the tablo-api package")
         except Exception:
             pass
-    return bool(HASH_KEY and DEVICE_KEY)
+    return bool(S.hash_key and S.device_key)
 
 
 class NetworkError(RuntimeError):
@@ -257,6 +484,7 @@ class NetworkError(RuntimeError):
 
 
 class HTTPStatusError(RuntimeError):
+    """The server answered, but with an HTTP error code (kept in .code)."""
     def __init__(self, msg, code):
         super().__init__(msg)
         self.code = code
@@ -298,6 +526,7 @@ def http(method, url, headers=None, body=None, timeout=15, retries=2):
 
 
 def load_cache() -> dict:
+    """Read tablo-cache.json (saved channel list etc.); {} if missing or broken."""
     try:
         return json.loads(CACHE_FILE.read_text(encoding="utf-8"))
     except Exception:
@@ -305,6 +534,8 @@ def load_cache() -> dict:
 
 
 def save_cache(data: dict) -> None:
+    """Write tablo-cache.json atomically (temp file + rename) so a crash can't
+    leave a half-written cache. No passwords or login tokens are stored in it."""
     try:
         tmp = CACHE_FILE.with_suffix(".tmp")
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -316,24 +547,32 @@ def save_cache(data: dict) -> None:
 
 
 def device_auth(method, path, body=""):
+    """Sign a request to the Tablo on your home network, the way the Tablo app does:
+    HMAC-MD5 over method, path, MD5 of the body and the date, using the app's keys.
+    Returns the (Authorization, Date) headers the Tablo expects."""
     date = format_datetime(datetime.now(timezone.utc), usegmt=True)
     md5 = hashlib.md5(body.encode()).hexdigest() if body else ""
-    sig = hmac.new(HASH_KEY.encode(), f"{method}\n{path}\n{md5}\n{date}".encode(), hashlib.md5).hexdigest()
-    return f"tablo:{DEVICE_KEY}:{sig}", date
+    sig = hmac.new(S.hash_key.encode(), f"{method}\n{path}\n{md5}\n{date}".encode(), hashlib.md5).hexdigest()
+    return f"tablo:{S.device_key}:{sig}", date
 
 
 def pick_logo(logos) -> str:
+    """Best channel logo URL from Tablo's list (prefers the large light version)."""
     logos = [l for l in (logos or []) if isinstance(l, dict) and l.get("url")]
     pref = next((l for l in logos if l.get("kind") == "lightLarge"), None)
     return (pref or (logos[0] if logos else {})).get("url", "")
 
 
 def vlc_tuning() -> dict:
-    """Per-item VLC options for smooth live TV."""
-    opts = {"network-caching": str(VLC_BUFFER_MS)}
-    if DEINTERLACE and DEINTERLACE != "off":
+    """Per-item VLC options for smooth live TV.
+    network-caching = how many milliseconds of video VLC holds before playing
+    (3 s by default, quick to start and change channels). If VLC stutters on
+    Wi-Fi or network hiccups, a 10 s buffer (vlc_buffer = 10000) rides them out,
+    at the cost of a longer wait when starting or changing channels."""
+    opts = {"network-caching": str(S.vlc_buffer_ms)}
+    if S.deinterlace and S.deinterlace != "off":
         opts["deinterlace"] = "-1"            # automatic: only interlaced (e.g. 1080i) broadcasts
-        opts["deinterlace-mode"] = DEINTERLACE
+        opts["deinterlace-mode"] = S.deinterlace
     return opts
 
 
@@ -396,6 +635,7 @@ def airing_line(a: dict) -> str:
 
 
 def time_left(a: dict) -> str:
+    """'12 min left' for an airing that's on now; '' otherwise."""
     if not a or not a.get("_end"):
         return ""
     mins = int((a["_end"] - datetime.now(timezone.utc)).total_seconds() // 60)
@@ -404,6 +644,8 @@ def time_left(a: dict) -> str:
 
 @dataclass
 class Channel:
+    """One channel. kind is 'ota' (local over-the-air) or 'ott' (FAST/streaming).
+    identifier is Tablo's internal id (e.g. S122912_503_01), used in every API call."""
     identifier: str
     call_sign: str
     major: int = 0
@@ -415,12 +657,18 @@ class Channel:
 
     @property
     def display_name(self):
+        """'9.1 KWTV' for local channels, just the name for FAST channels."""
         return f"{self.major}.{self.minor} {self.call_sign}" if self.major else self.call_sign
 
 
 class Tablo:
+    """Talks to the Tablo: the cloud (login, channel list, guide) and the box on
+    your home network (tuning channels). Falls back to a saved channel list when
+    the internet is down, and never touches the internet in --offline mode."""
     def __init__(self, email: str, password: str, device_name: str = "",
                  lan_only: bool = False, tablo_ip: str = ""):
+        """Log in (or load the saved channel list when offline / --offline).
+        tablo_ip overrides the Tablo's address (if it changed)."""
         self.email, self.password, self.device_name = email, password, device_name
         self.lan_only = lan_only
         self.lock = threading.Lock()
@@ -431,6 +679,7 @@ class Tablo:
         self.access_token = self.lh_token = ""
         self._last_try = 0.0
         self._timeout, self._retries = 10, 2
+        self._login_lock = threading.Lock()         # one re-login at a time
         if lan_only:
             if not self.cache.get("channels"):
                 raise NetworkError("No saved channel list yet. Run once with the internet connected "
@@ -478,6 +727,7 @@ class Tablo:
                     f"need the internet. Will retry automatically.")
 
     def _save_cache(self, **extra) -> None:
+        """Save the Tablo's address, channel list and our client id for offline use."""
         self.cache.update({
             "saved": datetime.now().strftime("%Y-%m-%d %H:%M"),
             "device_name": getattr(self, "device_label", ""),
@@ -509,14 +759,20 @@ class Tablo:
             self._timeout, self._retries = old
 
     def connect(self) -> None:
+        """Full cloud login: email+password -> account -> pick the Tablo -> device token
+        -> channel list. Updates everything in place and saves the cache."""
         jhdr = {"User-Agent": CLOUD_UA, "Content-Type": "application/json"}
         to, rt = self._timeout, self._retries
+        # Step 1: email + password -> access token (proves who you are)
         login = http("POST", f"{CLOUD}/api/v2/login/", jhdr,
                      json.dumps({"email": self.email, "password": self.password}).encode(),
                      timeout=to, retries=rt)
         self.access_token = login["access_token"]
+        register_secret(self.access_token)
+        register_secret(self.password)
         auth = {**jhdr, "Authorization": f"{login['token_type']} {self.access_token}"}
 
+        # Step 2: the account -> your Tablo box(es); its 'url' is its home-network address
         acct = http("GET", f"{CLOUD}/api/v2/account/", auth, timeout=to, retries=rt)
         if not acct.get("devices"):
             sys.exit("No Tablo devices found on this account.")
@@ -526,11 +782,14 @@ class Tablo:
                         if d["name"].lower() == self.device_name.lower()), dev)
         self.device_url = dev["url"].rstrip("/")
 
+        # Step 3: pick that box + your profile -> the "Lighthouse" token for guide requests
         sel = http("POST", f"{CLOUD}/api/v2/account/select/", auth,
                    json.dumps({"pid": acct["profiles"][0]["identifier"],
                                "sid": dev["serverId"]}).encode(), timeout=to, retries=rt)
         self.lh_token = sel["token"]
+        register_secret(self.lh_token)
 
+        # Step 4: the channel list (local OTA + FAST), turned into Channel objects
         raw = http("GET", f"{CLOUD}/api/v2/account/{self.lh_token}/guide/channels/",
                    {**jhdr, "Authorization": f"Bearer {self.access_token}",
                     "Lighthouse": self.lh_token, "Accept": "*/*"}, timeout=to, retries=rt)
@@ -555,6 +814,7 @@ class Tablo:
         if not any(k != "ota" for k in kinds):
             log.info("Tablo returned no FAST/streaming channels for this account "
                      "(check FAST channels are enabled in the Tablo app).")
+        # Local channels first, in channel-number order (2.1, 4.1, 9.1...), then FAST
         chans.sort(key=lambda c: (c.kind != "ota", c.major, c.minor, c.call_sign.lower()))
         self.channels = chans
         self.device_label = dev["name"]
@@ -565,14 +825,33 @@ class Tablo:
 
     @property
     def ota(self):
+        """Local over-the-air channels."""
         return [c for c in self.channels if c.kind == "ota"]
 
     @property
     def ott(self):
+        """FAST (free internet streaming) channels."""
         return [c for c in self.channels if c.kind != "ota"]
 
     # ---------------- guide (what's on) ----------------
+    def _cloud_get(self, make_url, timeout=6, retries=1):
+        """GET a Tablo cloud guide URL. If the cloud says our login has expired
+        (401/403), which happens on long-running servers, log in again and retry
+        once. make_url is a function because the URL can contain the token."""
+        old_token = self.lh_token
+        try:
+            return http("GET", make_url(), self._guide_headers(), timeout=timeout, retries=retries)
+        except HTTPStatusError as e:
+            if e.code not in (401, 403):
+                raise
+        with self._login_lock:
+            if self.lh_token == old_token:          # nobody else refreshed it meanwhile
+                log.info("Tablo cloud login expired; logging in again")
+                self.connect()
+        return http("GET", make_url(), self._guide_headers(), timeout=timeout, retries=retries)
+
     def _guide_headers(self):
+        """Headers for Tablo cloud guide requests (login token + device token)."""
         return {"User-Agent": CLOUD_UA, "Accept": "*/*", "Content-Type": "application/json",
                 "Authorization": f"Bearer {self.access_token}", "Lighthouse": self.lh_token}
 
@@ -586,8 +865,7 @@ class Tablo:
             return self._saved_now()
         now, raw = {}, {}
         try:
-            rows = http("GET", f"{CLOUD}/api/v2/account/{self.lh_token}/guide/channels/live/",
-                        self._guide_headers(), timeout=6, retries=1) or []
+            rows = self._cloud_get(lambda: f"{CLOUD}/api/v2/account/{self.lh_token}/guide/channels/live/") or []
             for row in rows:
                 ch, airing = row.get("channel") or {}, row.get("airing") or {}
                 if ch.get("identifier") and airing:
@@ -630,8 +908,8 @@ class Tablo:
         for n in range(days):
             day = datetime.now().date() + timedelta(days=n)
             try:
-                rows = http("GET", f"{CLOUD}/api/v2/account/guide/channels/{ident}/airings/{day.isoformat()}/",
-                            self._guide_headers(), timeout=6, retries=1) or []
+                rows = self._cloud_get(
+                    lambda: f"{CLOUD}/api/v2/account/guide/channels/{ident}/airings/{day.isoformat()}/") or []
             except Exception as e:
                 log.debug(f"Couldn't load guide for {ident} on {day}: {e}")
                 continue
@@ -651,6 +929,7 @@ class Tablo:
         return [a for a in self.airings(ident) if a["_end"] and a["_end"] > now][:count]
 
     def by_id(self, ident: str):
+        """Channel for a Tablo identifier, or None."""
         return next((c for c in self.channels if c.identifier == ident), None)
 
     def find(self, wanted: str):
@@ -683,6 +962,8 @@ class Tablo:
         return None
 
     def _watch(self, ident: str) -> str:
+        """Ask the Tablo (on your network) to tune a channel. Returns the stream URL
+        (HLS) and remembers the session token so the tuner can be freed later."""
         path = f"/guide/channels/{ident}/watch"
         body = json.dumps({
             "bandwidth": None,
@@ -700,6 +981,7 @@ class Tablo:
         if not resp or not resp.get("playlist_url"):
             raise RuntimeError(f"No playlist_url in response: {resp}")
         self._last_token = resp.get("token") or ""
+        register_secret(self._last_token)
         return resp["playlist_url"]
 
     def end_session(self, token: str) -> None:
@@ -724,6 +1006,8 @@ class Tablo:
         return url, self._last_token
 
     def watch_url(self, ident: str) -> str:
+        """Tune a channel, recovering from common problems: FAST channels fall back to
+        their direct stream; otherwise re-login (new address / fresh session) and retry."""
         ch = self.by_id(ident)
         with self.lock:
             if ch and ch.kind != "ota" and not self.maybe_reconnect(min_gap=15):
@@ -759,13 +1043,16 @@ class Tablo:
             return self._watch(ident)
 
 
-# ----------------------------------------------------------------------
-# Favorites (stored as channel identifiers)
-# ----------------------------------------------------------------------
+# =============================================================================
+# SECTION 5: FAVORITES
+# The 'favorites =' line in tablo.ini (channel numbers or call signs).
+# =============================================================================
 class Favorites:
     """The 'favorites' line in tablo.ini, e.g. favorites = 4.1, 9.1, KFOR.
     Edit it by hand, or use --add-fav / --remove-fav / +N / -N in the menu."""
     def __init__(self, cfg, tablo: Tablo):
+        """Read the 'favorites' line from tablo.ini and match each entry to a channel.
+        Entries that don't match are kept in .missing (shown to you, never deleted)."""
         self.cfg, self.tablo = cfg, tablo
         t = cfg["tablo"]
         raw = t.get("favorites", "") or t.get("channels", "")
@@ -789,12 +1076,15 @@ class Favorites:
         self.ids = [c.identifier for c in self._chans]
 
     def channels(self):
+        """Favorite channels, in the order you listed them."""
         return list(self._chans)
 
     def others(self, chans):
+        """chans minus favorites (so nothing is listed twice)."""
         return [c for c in chans if c.identifier not in self.ids]
 
     def add(self, ch) -> bool:
+        """Add a favorite (not saved until save()). False if it was already one."""
         if ch.identifier in self.ids:
             return False
         self._chans.append(ch)
@@ -802,6 +1092,7 @@ class Favorites:
         return True
 
     def remove(self, ch) -> bool:
+        """Remove a favorite (not saved until save()). False if it wasn't one."""
         if ch.identifier not in self.ids:
             return False
         self._chans = [c for c in self._chans if c.identifier != ch.identifier]
@@ -818,6 +1109,9 @@ class Favorites:
         log.info("Favorites saved: " + (", ".join(c.display_name for c in self._chans) or "(none)"))
 
 
+# =============================================================================
+# SECTION 6: TV GUIDE + PLAYLISTS FOR IPTV APPS
+# =============================================================================
 # ----------------------------------------------------------------------
 # TV guide (XMLTV) for IPTV apps: TiviMate, UHF, iPlayTV, Kodi, Televizo...
 # Full listings for local channels and favorites; "now playing" for the rest.
@@ -826,13 +1120,30 @@ _xmltv_cache = {"at": 0.0, "xml": b""}
 _xmltv_lock = threading.Lock()
 
 
+GUIDE_REFRESH = 1800        # rebuild /guide.xml every 30 minutes
+
+
 def xmltv(tablo, favs) -> bytes:
+    """The XMLTV guide (/guide.xml) for IPTV apps. Building it takes one cloud
+    request per channel per day, so with --lan it's built in the background at
+    startup and kept fresh (start_guide_refresher). IPTV apps always get the
+    ready copy at once; only the very first request ever waits for a build."""
+    xml = _xmltv_cache["xml"]
+    if xml:
+        if time.time() - _xmltv_cache["at"] > GUIDE_REFRESH:      # stale: serve it, refresh behind
+            threading.Thread(target=build_xmltv, args=(tablo, favs), daemon=True).start()
+        return xml
+    return build_xmltv(tablo, favs)
+
+
+def build_xmltv(tablo, favs) -> bytes:
+    """Build the guide now (one build at a time; others wait and reuse it)."""
     with _xmltv_lock:
-        if _xmltv_cache["xml"] and time.time() - _xmltv_cache["at"] < 1800:
-            return _xmltv_cache["xml"]
-        def esc(t):
+        if _xmltv_cache["xml"] and time.time() - _xmltv_cache["at"] < 60:
+            return _xmltv_cache["xml"]           # someone else just built it
+        def esc(t):                     # make text safe inside XML
             return html.escape(str(t or ""), quote=True)
-        def stamp(dt):
+        def stamp(dt):                  # XMLTV time format: 20261019213000 +0000
             return dt.astimezone(timezone.utc).strftime("%Y%m%d%H%M%S +0000")
         now = tablo.now_playing()
         full = {c.identifier for c in tablo.ota} | set(favs.ids)
@@ -869,7 +1180,8 @@ def xmltv(tablo, favs) -> bytes:
 def tv_m3u(tablo, favs, host: str, favorites_only: bool = False) -> bytes:
     """Playlist for TV/IPTV apps: converted H.264 streams + the XMLTV guide."""
     now = tablo.now_playing()
-    lines = [f'#EXTM3U url-tvg="http://{host}/guide.xml" x-tvg-url="http://{host}/guide.xml"']
+    guide = f"http://{host}/guide.xml{kq()}"
+    lines = [f'#EXTM3U url-tvg="{guide}" x-tvg-url="{guide}"']
     for group, chans in ordered(tablo, favs):
         if favorites_only and group != "Favorites":
             continue
@@ -879,10 +1191,14 @@ def tv_m3u(tablo, favs, host: str, favorites_only: bool = False) -> bytes:
             title = c.display_name + (f" · {a['show']}" if a else "")
             attrs = (f'tvg-id="{c.identifier}" tvg-name="{c.call_sign}"' + (f' tvg-chno="{num}"' if num else "")
                      + (f' tvg-logo="{c.logo}"' if c.logo else "") + f' group-title="{group}"')
-            lines += [f"#EXTINF:-1 {attrs},{title}", f"http://{host}/live/{urllib.parse.quote(c.identifier)}/{TV_QUALITY}/index.m3u8"]
+            lines += [f"#EXTINF:-1 {attrs},{title}",
+                      f"http://{host}/live/{urllib.parse.quote(c.identifier)}/{S.tv_quality}/index.m3u8{kq()}"]
     return ("\n".join(lines) + "\n").encode()
 
 
+# =============================================================================
+# SECTION 7: BROWSER/TV PLAYBACK (ffmpeg conversion)
+# =============================================================================
 # ----------------------------------------------------------------------
 # Browser playback (iPhone Safari, Android Chrome, any browser)
 # The Tablo 4th Gen sends the raw broadcast (usually MPEG-2 video), which phone
@@ -890,9 +1206,12 @@ def tv_m3u(tablo, favs, host: str, favorites_only: bool = False) -> bytes:
 # ----------------------------------------------------------------------
 HLS_JS_URL = "https://cdn.jsdelivr.net/npm/hls.js@1/dist/hls.min.js"
 HLS_JS_FILE = Path(__file__).resolve().parent / "tablo-hls.min.js"
-BROWSER_QUALITY = 720        # phones/tablets: max picture height (tablo.ini browser_quality)
-TV_QUALITY = 1080            # TVs and IPTV apps: max picture height (tablo.ini tv_quality)
-LAN_BASE = ""                # "http://<this PC's IP>:<port>" when --lan is on (for Cast)
+
+
+def kq(sep: str = "?") -> str:
+    """'?key=…' to append to links we hand out, when an access key is set.
+    IPTV apps, VLC and Chromecasts don't keep cookies, so links carry the key."""
+    return f"{sep}key={urllib.parse.quote(S.access_key)}" if S.access_key else ""
 QUALITIES = (360, 480, 540, 720, 1080)
 
 
@@ -912,10 +1231,97 @@ def ensure_hls_js() -> None:
         log.debug(f"Couldn't download hls.js: {e}")
 
 
+# --- Video encoders for the phone/TV conversion -------------------------------
+# Hardware encoders (your GPU) use far less CPU than software x264: better for
+# laptops (battery, fans), headless boxes and several TVs at once. 'auto' tries
+# the ones that fit this OS with a tiny test encode and uses the first that works;
+# libx264 (software) always works as the fallback.
+ENCODERS = {
+    "x264": {"label": "software (libx264)", "pre": [], "vf_tail": "",
+             "codec": ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-maxrate", "5M",
+                       "-bufsize", "10M", "-pix_fmt", "yuv420p", "-profile:v", "high", "-sc_threshold", "0"]},
+    "vaapi": {"label": "VAAPI (Intel/AMD graphics)", "pre": ["-vaapi_device", "%DRI%"],
+              "vf_tail": ",format=nv12,hwupload",
+              "codec": ["-c:v", "h264_vaapi", "-qp", "23", "-profile:v", "high"]},
+    "nvenc": {"label": "NVENC (NVIDIA graphics)", "pre": [], "vf_tail": "",
+              "codec": ["-c:v", "h264_nvenc", "-preset", "p4", "-rc", "vbr", "-cq", "23", "-b:v", "0",
+                        "-maxrate", "6M", "-bufsize", "12M", "-pix_fmt", "yuv420p", "-profile:v", "high"]},
+    "qsv": {"label": "Quick Sync (Intel graphics)", "pre": [], "vf_tail": ",format=nv12",
+            "codec": ["-c:v", "h264_qsv", "-global_quality", "23", "-look_ahead", "0", "-profile:v", "high"]},
+    "amf": {"label": "AMF (AMD graphics)", "pre": [], "vf_tail": "",
+            "codec": ["-c:v", "h264_amf", "-quality", "speed", "-rc", "cqp", "-qp_i", "23", "-qp_p", "23",
+                      "-pix_fmt", "yuv420p"]},
+    "videotoolbox": {"label": "VideoToolbox (Mac)", "pre": [], "vf_tail": "",
+                     "codec": ["-c:v", "h264_videotoolbox", "-b:v", "5M", "-pix_fmt", "yuv420p"]},
+}
+# What 'auto' tries, per OS, before falling back to x264.
+AUTO_ORDER = (["nvenc", "qsv", "amf"] if IS_WINDOWS else
+              ["videotoolbox"] if sys.platform == "darwin" else ["vaapi", "nvenc", "qsv"])
+
+
+def render_node() -> str:
+    """The Linux GPU device VAAPI uses (/dev/dri/renderD128 on most PCs)."""
+    nodes = sorted(Path("/dev/dri").glob("renderD*")) if Path("/dev/dri").exists() else []
+    return str(nodes[0]) if nodes else ""
+
+
+def encoder_args(name: str, height: int):
+    """(arguments before -i, the -vf filter chain, the video codec arguments)."""
+    enc = ENCODERS[name]
+    pre = [a.replace("%DRI%", render_node()) for a in enc["pre"]]
+    vf = f"yadif=deint=interlaced,scale=-2:'min({height},ih)'" + enc["vf_tail"]
+    return pre, vf, enc["codec"] + ["-g", "60", "-keyint_min", "60"]
+
+
+def encoder_works(name: str) -> bool:
+    """Try a half-second test encode with this encoder (takes ~1 s)."""
+    if name == "vaapi" and not render_node():
+        return False
+    pre, vf, codec = encoder_args(name, 720)
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", *pre,
+           "-f", "lavfi", "-i", "testsrc2=size=1280x720:rate=30", "-t", "0.5",
+           "-vf", vf, *codec, "-f", "null", "-"]
+    try:
+        r = subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, timeout=20)
+        if r.returncode != 0:
+            log.debug(f"Encoder {name} not usable: {r.stderr.decode(errors='replace').strip()[-200:]}")
+        return r.returncode == 0
+    except Exception as e:
+        log.debug(f"Encoder {name} test failed: {e}")
+        return False
+
+
+_encoder_lock = threading.Lock()
+
+
+def choose_encoder() -> str:
+    """Pick the encoder once (tablo.ini 'encoder', default auto) and remember it in S.encoder."""
+    with _encoder_lock:
+        if S.encoder:
+            return S.encoder
+        want = S.encoder_setting if S.encoder_setting in ENCODERS or S.encoder_setting == "auto" else "auto"
+        if S.encoder_setting not in ENCODERS and S.encoder_setting != "auto":
+            log.warning(f"encoder = {S.encoder_setting} isn't known; choose from auto, "
+                        + ", ".join(ENCODERS) + ". Using auto.")
+        tries = AUTO_ORDER if want == "auto" else [want]
+        S.encoder = "x264"
+        for name in tries:
+            if name != "x264" and encoder_works(name):
+                S.encoder = name
+                break
+            if want != "auto" and name != "x264":
+                log.warning(f"encoder = {name} doesn't work on this PC; using software (libx264)")
+        log.info(f"Video conversion for phones/TVs: {ENCODERS[S.encoder]['label']}")
+        return S.encoder
+
+
 class LiveJob:
-    def __init__(self, ident, q, label, token, folder, proc):
+    """One running ffmpeg converter: which channel/quality, its Tablo session token,
+    its temp folder of video segments, and who's watching (viewer IP -> last seen)."""
+    def __init__(self, ident, q, label, token, folder, proc, encoder="x264"):
         self.ident, self.q, self.label, self.token, self.folder, self.proc = ident, q, label, token, folder, proc
-        self.last = time.time()
+        self.encoder = encoder
+        self.started = self.last = time.time()
         self.viewers: dict[str, float] = {}
 
 
@@ -926,27 +1332,47 @@ class LiveTV:
     IDLE = 45
 
     def __init__(self, tablo):
+        """Start the idle-converter reaper and clean up folders from earlier crashes."""
         self.tablo = tablo
         self.jobs: dict[tuple, LiveJob] = {}       # (channel id, height) -> converter
-        self.viewer_ch: dict[str, tuple] = {}
+        self.viewer_ch: dict[str, tuple] = {}       # viewer IP -> what they watch
+        self.starting: dict[tuple, threading.Event] = {}   # tunes in progress
         self.lock = threading.Lock()
+        self._clean_leftovers()
         threading.Thread(target=self._reaper, daemon=True).start()
 
     @staticmethod
+    def _clean_leftovers(max_age: int = 3600) -> None:
+        """Delete converter folders left behind if the script was killed hard.
+        Only folders untouched for an hour, so another running copy is safe
+        (an active converter rewrites its folder every 2 seconds)."""
+        for d in Path(tempfile.gettempdir()).glob("tablo-live-*"):
+            try:
+                newest = max([d.stat().st_mtime] + [f.stat().st_mtime for f in d.iterdir()])
+                if time.time() - newest > max_age:
+                    shutil.rmtree(d, ignore_errors=True)
+                    log.debug(f"Removed leftover {d}")
+            except OSError:
+                pass
+
+    @staticmethod
     def available() -> bool:
+        """Browser/TV playback needs ffmpeg on this PC."""
         return bool(shutil.which("ffmpeg"))
 
     def _start(self, ident, q) -> LiveJob:
+        """(lock NOT held) Tune the Tablo and start ffmpeg converting that channel to
+        H.264/AAC HLS in a temp folder: deinterlaced, scaled to q lines, 2-second segments."""
         ch = self.tablo.by_id(ident)
         url, token = self.tablo.watch_session(ident)
         folder = Path(tempfile.mkdtemp(prefix="tablo-live-"))
         height = max(240, min(int(q), 2160))
-        cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error",
+        encoder = choose_encoder()
+        pre, vf, codec = encoder_args(encoder, height)
+        cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", *pre,
                "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "10",
                "-i", url, "-map", "0:v:0", "-map", "0:a:0?",
-               "-vf", f"yadif=deint=interlaced,scale=-2:'min({height},ih)'",
-               "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-maxrate", "5M", "-bufsize", "10M",
-               "-pix_fmt", "yuv420p", "-profile:v", "high", "-g", "60", "-keyint_min", "60", "-sc_threshold", "0",
+               "-vf", vf, *codec,                              # deinterlace + scale + H.264
                "-c:a", "aac", "-b:a", "160k", "-ac", "2",
                "-f", "hls", "-hls_time", "2", "-hls_list_size", "8",
                "-hls_flags", "delete_segments+independent_segments+omit_endlist",
@@ -956,11 +1382,20 @@ class LiveTV:
         label = ch.display_name if ch else ident
         threading.Thread(target=lambda: [log.warning(f"[{label}] browser ffmpeg: {l.decode(errors='replace').rstrip()}")
                                          for l in proc.stderr], daemon=True).start()
-        log.info(f"[{label}] converting for browser playback ({height}p)")
-        return LiveJob(ident, q, label, token, folder, proc)
+        log.info(f"[{label}] converting for browser playback ({height}p, {encoder})")
+        return LiveJob(ident, q, label, token, folder, proc, encoder)
 
-    def _stop(self, key) -> None:
-        job = self.jobs.pop(key, None)
+    # Locking rule: self.lock only guards the dictionaries. Anything slow
+    # (tuning the Tablo, stopping ffmpeg, ending a Tablo session) happens with
+    # the lock released, so one device starting a channel never makes other
+    # devices' video requests wait.
+
+    def _detach(self, key):
+        """(lock held) Remove a converter from the table; returns it for _shutdown."""
+        return self.jobs.pop(key, None)
+
+    def _shutdown(self, job) -> None:
+        """(lock NOT held) Stop ffmpeg, free the Tablo tuner, delete the temp folder."""
         if not job:
             return
         if job.proc.poll() is None:
@@ -976,44 +1411,79 @@ class LiveTV:
     def touch(self, ident, viewer, q=None) -> LiveJob:
         """Viewer is watching ident: start the converter if needed; stop the one
         they just left if nobody else is on it."""
-        key = (ident, int(q or BROWSER_QUALITY))
+        key = (ident, int(q or S.browser_quality))
+        to_stop = []
+        while True:
+            with self.lock:
+                job = self.jobs.get(key)
+                if job and job.proc.poll() is not None:     # ffmpeg died: restart it
+                    if job.encoder != "x264" and time.time() - job.started < 20:
+                        # A GPU encoder that passed the test but chokes on this broadcast
+                        log.warning(f"{ENCODERS[job.encoder]['label']} failed on {job.label}; "
+                                    f"switching to software encoding")
+                        S.encoder = "x264"
+                    to_stop.append(self._detach(key))
+                    job = None
+                if job:
+                    break
+                starting = self.starting.get(key)
+                if not starting:                            # we are the one who tunes
+                    starting = self.starting[key] = threading.Event()
+                    break
+            starting.wait(timeout=30)                       # someone else is tuning it
+        if not job:
+            try:
+                new = self._start(*key)                     # slow: Tablo tune + ffmpeg
+            finally:
+                with self.lock:
+                    self.starting.pop(key).set()
+            with self.lock:
+                job = self.jobs[key] = new
         with self.lock:
-            prev = self.viewer_ch.get(viewer)
-            self.viewer_ch[viewer] = key
-            job = self.jobs.get(key)
-            if job and job.proc.poll() is not None:     # ffmpeg died: restart
-                self._stop(key)
-                job = None
-            if not job:
-                job = self.jobs[key] = self._start(*key)
             now = time.time()
             job.last = now
             job.viewers[viewer] = now
-            if prev and prev != key and prev in self.jobs:
+            prev = self.viewer_ch.get(viewer)
+            self.viewer_ch[viewer] = key
+            if prev and prev != key and prev in self.jobs:  # viewer switched channels
                 old = self.jobs[prev]
                 old.viewers.pop(viewer, None)
                 if not any(now - t < 15 for t in old.viewers.values()):
-                    self._stop(prev)
-            return job
+                    to_stop.append(self._detach(prev))
+        for old_job in to_stop:
+            self._shutdown(old_job)
+        return job
 
     def get(self, ident, q=None):
-        return self.jobs.get((ident, int(q or BROWSER_QUALITY)))
+        """The running converter for a channel/quality, if any."""
+        return self.jobs.get((ident, int(q or S.browser_quality)))
 
     def _reaper(self) -> None:
+        """Every 10 s: stop converters nobody has fetched video from for IDLE seconds."""
         while True:
             time.sleep(10)
             with self.lock:
-                for key in [k for k, j in self.jobs.items() if time.time() - j.last > self.IDLE]:
-                    self._stop(key)
+                idle = [self._detach(k) for k, j in list(self.jobs.items())
+                        if time.time() - j.last > self.IDLE]
+            for job in idle:
+                self._shutdown(job)
 
     def stop_all(self) -> None:
+        """Stop every converter (used when the script quits)."""
         with self.lock:
-            for key in list(self.jobs):
-                self._stop(key)
+            jobs = [self._detach(k) for k in list(self.jobs)]
+        for job in jobs:
+            self._shutdown(job)
 
 
+
+# =============================================================================
+# SECTION 8: WEB PAGES
+# HTML/CSS/JavaScript for the pages, kept as strings with %%NAME%% blanks that
+# fill() replaces. Braces { } are plain CSS/JS here, not Python formatting.
+# =============================================================================
 # ----------------------------------------------------------------------
-# Channel page
+# Channel page (/): phones, tablets and the PC
 # ----------------------------------------------------------------------
 PAGE = """<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
@@ -1021,43 +1491,54 @@ PAGE = """<!doctype html><html><head><meta charset="utf-8">
 <meta name="apple-mobile-web-app-title" content="Tablo TV"><meta name="theme-color" content="#16181c">
 <title>Tablo Channels</title>
 <style>
-:root{{--bg:#fff;--fg:#1a1a1a;--mute:#666;--line:#e3e3e3;--acc:#e8590c}}
-@media (prefers-color-scheme:dark){{:root{{--bg:#16181c;--fg:#eee;--mute:#9a9a9a;--line:#2c2f36}}}}
-body{{background:var(--bg);color:var(--fg);font:15px/1.4 system-ui,sans-serif;margin:0 auto;max-width:1600px;padding:16px}}
-h1{{font-size:20px;margin:0 0 4px}} h2{{font-size:15px;margin:24px 0 6px;color:var(--mute);text-transform:uppercase;letter-spacing:.05em}}
-p{{color:var(--mute);margin:0 0 12px}}
-.grid{{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));column-gap:24px}}
-.row{{display:flex;align-items:center;gap:10px;padding:6px 4px;border-bottom:1px solid var(--line);min-width:0}}
-.num{{font-variant-numeric:tabular-nums;min-width:52px;font-weight:600}}
-.name{{flex:1;min-width:0;display:flex;flex-direction:column}} .net{{color:var(--mute);font-size:13px}}
-.ch,.now{{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
-.now{{font-size:13px;color:var(--mute);cursor:help}} .left{{opacity:.8}}
-a{{color:var(--acc);text-decoration:none}}
-.bar{{position:sticky;bottom:0;background:var(--bg);padding:12px 0;display:flex;gap:12px;flex-wrap:wrap;align-items:center;border-top:1px solid var(--line)}}
-button{{background:var(--acc);color:#fff;border:0;border-radius:8px;padding:10px 18px;font-size:15px;cursor:pointer}}
-#player{{display:none;position:sticky;top:0;z-index:5;background:var(--bg);padding:0 0 10px;border-bottom:1px solid var(--line)}}
-#player video{{width:100%;max-height:62vh;background:#000;border-radius:8px;display:block}}
-#player .ph{{display:flex;align-items:center;gap:10px;padding:6px 0}} #ptitle{{flex:1;font-weight:600}}
-#pstate{{color:var(--mute);font-size:13px}} #pclose{{padding:6px 12px;font-size:14px}}
-.saved{{color:var(--acc)}} .warn{{border:1px solid var(--acc);border-radius:8px;padding:8px 12px;margin:8px 0;color:var(--fg)}} .small{{font-size:13px;margin-top:8px}}
+:root{--bg:#fff;--fg:#1a1a1a;--mute:#666;--line:#e3e3e3;--acc:#e8590c}
+@media (prefers-color-scheme:dark){:root{--bg:#16181c;--fg:#eee;--mute:#9a9a9a;--line:#2c2f36}}
+body{background:var(--bg);color:var(--fg);font:15px/1.4 system-ui,sans-serif;margin:0 auto;max-width:1600px;padding:16px}
+h1{font-size:20px;margin:0 0 4px} h2{font-size:15px;margin:24px 0 6px;color:var(--mute);text-transform:uppercase;letter-spacing:.05em}
+p{color:var(--mute);margin:0 0 12px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));column-gap:24px}
+.row{display:flex;align-items:center;gap:10px;padding:6px 4px;border-bottom:1px solid var(--line);min-width:0}
+.num{font-variant-numeric:tabular-nums;min-width:52px;font-weight:600}
+.name{flex:1;min-width:0;display:flex;flex-direction:column} .net{color:var(--mute);font-size:13px}
+.ch,.now{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.now{font-size:13px;color:var(--mute);cursor:help} .left{opacity:.8}
+a{color:var(--acc);text-decoration:none}
+.bar{position:sticky;bottom:0;background:var(--bg);padding:12px 0;display:flex;gap:12px;flex-wrap:wrap;align-items:center;border-top:1px solid var(--line)}
+button{background:var(--acc);color:#fff;border:0;border-radius:8px;padding:10px 18px;font-size:15px;cursor:pointer}
+#player{display:none;position:sticky;top:0;z-index:5;background:var(--bg);padding:0 0 10px;border-bottom:1px solid var(--line)}
+#player video{width:100%;max-height:62vh;background:#000;border-radius:8px;display:block}
+#player .ph{display:flex;align-items:center;gap:10px;padding:6px 0} #ptitle{flex:1;font-weight:600}
+#pstate{color:var(--mute);font-size:13px} #pclose{padding:6px 12px;font-size:14px}
+.saved{color:var(--acc)} .warn{border:1px solid var(--acc);border-radius:8px;padding:8px 12px;margin:8px 0;color:var(--fg)} .small{font-size:13px;margin-top:8px}
 </style></head><body>
 <div id="player"><div class="ph"><span id="ptitle"></span><span id="pstate"></span>
 <google-cast-launcher id="castbtn" style="display:none;width:30px;height:30px;--connected-color:#e8590c;cursor:pointer"></google-cast-launcher>
 <button id="pclose" type="button">Close</button></div><video id="video" controls playsinline autoplay x-webkit-airplay="allow"></video></div>
 <h1>Tablo Channels</h1>
 <p>Click Play to watch. Hover over a show for its description. Favorites come from the <b>favorites</b> line in tablo.ini.</p>
-<h2>Favorites</h2>{missing}{fav}
-<h2>Local (OTA)</h2>{ota}
-<h2>FAST (online)</h2>{ott}
+<h2>Favorites</h2>%%MISSING%%%%FAV%%
+<h2>Local (OTA)</h2>%%OTA%%
+<h2>FAST (online)</h2>%%OTT%%
 <div class="bar">
 <a href="#" class="play pconly" data-id="all">Open all (VLC)</a>
 <a href="#" class="play pconly" data-id="favorites">Open favorites (VLC)</a>
 <span class="saved" id="msg"></span></div>
-<p class="small">{player_note} VLC app on other devices: <a href="/playlist.m3u">all .m3u</a> &middot; <a href="/favorites.m3u">favorites .m3u</a></p>
-<script>window.TABLO = {tablo_cfg};</script>
+<p class="small">%%PLAYER_NOTE%% VLC app on other devices: <a href="/playlist.m3u">all .m3u</a> &middot; <a href="/favorites.m3u">favorites .m3u</a></p>
+<script>window.TABLO = %%TABLO_CFG%%;</script>
 <script src="/hls.min.js"></script>
-{cast_tag}<script>{script}</script>
+%%CAST_TAG%%<script>%%SCRIPT%%</script>
 </body></html>"""
+
+def fill(template: str, **values) -> str:
+    """Fill %%NAME%% placeholders in a page template. Both web pages use this one
+    style, so their CSS and JavaScript can use normal { } braces."""
+    for name, value in values.items():
+        template = template.replace(f"%%{name}%%", str(value))
+    leftover = re.findall(r"%%[A-Z_]+%%", template)
+    if leftover:
+        raise ValueError(f"unfilled page placeholders: {leftover}")
+    return template
+
 
 # ----------------------------------------------------------------------
 # TV page (/tv): Fire TV Silk, Samsung TV browser, Google TV browsers, LG...
@@ -1095,7 +1576,7 @@ h2{font-size:20px;letter-spacing:.08em;text-transform:uppercase;color:#9aa3b2;ma
 <div class="keys">▲▼ / CH+ CH− change channel · OK info · Back close</div></div></div>
 <script src="/hls.min.js"></script>
 <script>
-const TVQ = %%TVQ%%;
+const TVQ = %%TVQ%%, KEY = %%KEY%%;   // KEY: access key, if one is set in tablo.ini
 const tiles = [...document.querySelectorAll(".tile")];
 const ov = document.getElementById("ov"), v = document.getElementById("v"), info = document.getElementById("info");
 const ititle = document.getElementById("ititle"), ishow = document.getElementById("ishow"), istate = document.getElementById("istate");
@@ -1110,7 +1591,7 @@ function play(i) {
   if (ov.style.display !== "block") { ov.style.display = "block"; history.pushState({tv: 1}, ""); 
     try { (document.documentElement.requestFullscreen || document.documentElement.webkitRequestFullscreen || function(){}).call(document.documentElement); } catch (e) {} }
   ititle.textContent = t.dataset.label; ishow.textContent = t.dataset.show || ""; istate.textContent = "Tuning…"; showInfo(8000);
-  const src = "/live/" + encodeURIComponent(t.dataset.id) + "/" + TVQ + "/index.m3u8";
+  const src = "/live/" + encodeURIComponent(t.dataset.id) + "/" + TVQ + "/index.m3u8" + (KEY ? "?key=" + encodeURIComponent(KEY) : "");
   if (v.canPlayType("application/vnd.apple.mpegurl")) { v.src = src; }
   else if (window.Hls && Hls.isSupported()) {
     hls = new Hls({liveSyncDurationCount: 3, manifestLoadingMaxRetry: 6, manifestLoadingRetryDelay: 1500});
@@ -1162,6 +1643,7 @@ setInterval(() => { if (ov.style.display !== "block") location.reload(); }, 10 *
 
 
 def render_tv_page(tablo, favs) -> bytes:
+    """The /tv page: one big focusable tile per channel, grouped like the menu."""
     now = tablo.now_playing()
     def tile(ch):
         num = f"{ch.major}.{ch.minor}" if ch.major else ""
@@ -1183,8 +1665,8 @@ def render_tv_page(tablo, favs) -> bytes:
         notice = '<div class="warn">To watch on a TV, install ffmpeg on the PC running tablo-vlc.</div>'
     elif tablo.lan_only or not tablo.online:
         notice = '<div class="warn">No internet: local channels only.</div>'
-    return (TV_PAGE.replace("%%SECTIONS%%", "".join(sections)).replace("%%NOTICE%%", notice)
-            .replace("%%TVQ%%", str(TV_QUALITY))).encode()
+    return fill(TV_PAGE, SECTIONS="".join(sections), NOTICE=notice,
+                TVQ=str(S.tv_quality), KEY=json.dumps(S.access_key)).encode()
 
 
 PAGE_SCRIPT = r"""
@@ -1202,7 +1684,8 @@ if (!IS_PC) document.querySelectorAll(".pconly").forEach(e => e.style.display = 
 function castSession() { try { return cast.framework.CastContext.getInstance().getCurrentSession(); } catch (e) { return null; } }
 function castLoad(c) {
   const s = castSession(); if (!s || !c) return false;
-  const mi = new chrome.cast.media.MediaInfo(TABLO.lan + "/live/" + encodeURIComponent(c.id) + "/" + TABLO.tvq + "/index.m3u8",
+  const mi = new chrome.cast.media.MediaInfo(TABLO.lan + "/live/" + encodeURIComponent(c.id) + "/" + TABLO.tvq + "/index.m3u8"
+                                             + (TABLO.key ? "?key=" + encodeURIComponent(TABLO.key) : ""),
                                              "application/x-mpegurl");
   mi.streamType = chrome.cast.media.StreamType.LIVE;
   mi.hlsSegmentFormat = chrome.cast.media.HlsSegmentFormat.TS;
@@ -1237,7 +1720,7 @@ function watchHere(id, label) {
   stopVideo();
   player.style.display = "block"; window.scrollTo(0, 0);
   ptitle.textContent = label; pstate.textContent = "Tuning… (takes a few seconds)";
-  const src = "/live/" + encodeURIComponent(id) + "/index.m3u8";
+  const src = "/live/" + encodeURIComponent(id) + "/index.m3u8" + (TABLO.key ? "?key=" + encodeURIComponent(TABLO.key) : "");
   if (video.canPlayType("application/vnd.apple.mpegurl")) {          // iPhone/iPad Safari
     video.src = src;
   } else if (window.Hls && Hls.isSupported()) {                        // Android Chrome, desktop
@@ -1277,6 +1760,8 @@ if (want) { const a = document.querySelector('a.play[data-id="' + CSS.escape(wan
 
 
 def render_page(tablo: Tablo, favs: Favorites) -> bytes:
+    """The main web page: channel list with Play buttons, the inline browser
+    player (phones/tablets), Cast/AirPlay support and links for other devices."""
     now = tablo.now_playing()
 
     def row(ch):
@@ -1313,47 +1798,94 @@ def render_page(tablo: Tablo, favs: Favorites) -> bytes:
                    + html.escape(", ".join(favs.missing))
                    + "</b>. Use the numbers or call signs shown below.</p>")
     note = ("On a phone or tablet, Play watches right in the browser"
-            + (" (and can Cast/AirPlay to a TV)." if LAN_BASE else ".") if LiveTV.available()
+            + (" (and can Cast/AirPlay to a TV)." if S.lan_base else ".") if LiveTV.available()
             else "To watch in a phone/tablet browser, install ffmpeg on this PC.")
-    if LAN_BASE and LiveTV.available():
-        note += (f' TVs: <a href="/tv">TV page</a> &middot; IPTV apps: <a href="/tv.m3u">tv.m3u</a> + '
-                 f'<a href="/guide.xml">guide.xml</a>.')
-    cfg = json.dumps({"lan": LAN_BASE, "tvq": TV_QUALITY})
+    if S.lan_base and LiveTV.available():
+        k = html.escape(kq())          # so copied links work in IPTV apps too
+        note += (f' TVs: <a href="/tv{k}">TV page</a> &middot; IPTV apps: <a href="/tv.m3u{k}">tv.m3u</a> + '
+                 f'<a href="/guide.xml{k}">guide.xml</a>.')
+    cfg = json.dumps({"lan": S.lan_base, "tvq": S.tv_quality, "key": S.access_key})
     cast_tag = ('<script src="https://www.gstatic.com/cv/js/sender/v1/cast_sender.js?loadCastFramework=1"></script>'
-                if LAN_BASE and LiveTV.available() and tablo.online else "")
-    return PAGE.format(
-        script=PAGE_SCRIPT, player_note=note, tablo_cfg=cfg, cast_tag=cast_tag,
-        missing=missing,
-        fav=section(favs.channels(), "None set. Add e.g. <code>favorites = 4.1, 9.1</code> to tablo.ini."),
-        ota=section(favs.others(tablo.ota), "None found."),
-        ott=section(favs.others(tablo.ott), "None found."),
+                if S.lan_base and LiveTV.available() and tablo.online else "")
+    return fill(PAGE,
+        SCRIPT=PAGE_SCRIPT, PLAYER_NOTE=note, TABLO_CFG=cfg, CAST_TAG=cast_tag,
+        MISSING=missing,
+        FAV=section(favs.channels(), "None set. Add e.g. <code>favorites = 4.1, 9.1</code> to tablo.ini."),
+        OTA=section(favs.others(tablo.ota), "None found."),
+        OTT=section(favs.others(tablo.ott), "None found."),
     ).encode()
 
 
-# ----------------------------------------------------------------------
-# HTTP server
-# ----------------------------------------------------------------------
+# =============================================================================
+# SECTION 9: WEB SERVER
+# Every URL VLC, browsers, TVs and IPTV apps use. make_handler() builds a
+# Handler class around one Tablo + Favorites; each request runs in its own
+# thread. Order for every request: check the access key -> route by path.
+# =============================================================================
 def make_handler(tablo: Tablo, favs: Favorites, port: int):
+    """Build the web server's request handler. Everything other devices see goes
+    through here: pages, playlists, the guide, VLC streams (/ch) and browser/TV
+    video (/live). Also tracks which device watches what, to free tuners."""
     live = LiveTV(tablo)
     sessions: dict[str, str] = {}      # viewer IP -> Tablo session token
     sessions_lock = threading.Lock()
 
     class Handler(BaseHTTPRequestHandler):
+        """One instance per web request (ThreadingHTTPServer runs them in threads)."""
         def log_message(self, fmt, *args):
+            """Silence the default per-request console logging."""
             pass  # keep the console quiet
 
+        # ---- access key (optional, tablo.ini access_key) ----------------------
+        def from_this_pc(self) -> bool:
+            """Request came from this computer itself (always trusted)."""
+            return self.client_address[0] in ("127.0.0.1", "::1")
+
+        def given_key(self) -> str:
+            """Key from ?key=… or from the tablo_key cookie set on an earlier visit."""
+            q = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query).get("key")
+            if q:
+                return q[0]
+            cookie = SimpleCookie(self.headers.get("Cookie", ""))
+            return cookie["tablo_key"].value if "tablo_key" in cookie else ""
+
+        def authorized(self) -> bool:
+            """The PC itself is always allowed; other devices need the key, if one is set."""
+            if not S.access_key or self.from_this_pc():
+                return True
+            return hmac.compare_digest(self.given_key().encode(), S.access_key.encode())
+
+        def deny(self):
+            """401 for devices without the access key (the key itself is never logged)."""
+            log.warning(f"Refused {self.client_address[0]} (missing or wrong access key)")
+            self.send_body(b"This Tablo server needs an access key. Open the address shown when "
+                           b"tablo-vlc starts (it ends with ?key=...).", "text/plain; charset=utf-8", 401)
+
         def send_body(self, body: bytes, ctype: str, code: int = 200, cors: bool = False):
+            """Send a complete response. cors=True lets Cast receivers and IPTV apps read it."""
             self.send_response(code)
             self.send_header("Content-Type", ctype)
             if cors:
                 self.send_header("Access-Control-Allow-Origin", "*")
+            # First visit with ?key=… on a page: remember it on that device for a year,
+            # so the page's own video requests (and bookmarks) work without the key.
+            if S.access_key and ctype.startswith("text/html") and "key=" in self.path and self.authorized():
+                self.send_header("Set-Cookie", f"tablo_key={urllib.parse.quote(S.access_key)}; "
+                                               f"Max-Age=31536000; Path=/; SameSite=Lax; HttpOnly")
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
             self.end_headers()
             self.wfile.write(body)
 
         def do_GET(self):
+            """Route a GET request. Main paths:
+            /                 web page (phones/PC)      /tv            TV page
+            /playlist.m3u     VLC playlist              /tv.m3u        IPTV playlist
+            /guide.xml        XMLTV guide               /ch/<id>       stream for VLC
+            /live/<id>/...    converted video for browsers, TVs and Cast"""
             path = self.path.split("?")[0]
+            if path != "/hls.min.js" and not self.authorized():   # the player library is public
+                return self.deny()
             if path in ("/", "/index.html"):
                 return self.send_body(render_page(tablo, favs),
                                       "text/html; charset=utf-8")
@@ -1388,7 +1920,7 @@ def make_handler(tablo: Tablo, favs: Favorites, port: int):
             """/live/<id>/index.m3u8 and /live/<id>/segNNNNN.ts for browser playback."""
             parts = path.split("/")
             if len(parts) == 4:                       # /live/<id>/<file>  (phone quality)
-                q = BROWSER_QUALITY
+                q = S.browser_quality
             elif len(parts) == 5 and parts[3].isdigit() and int(parts[3]) in QUALITIES:
                 q = int(parts[3])                     # /live/<id>/<height>/<file>
             else:
@@ -1400,6 +1932,9 @@ def make_handler(tablo: Tablo, favs: Favorites, port: int):
             if not LiveTV.available():
                 return self.send_body(b"Install ffmpeg on the PC to watch in a browser.", "text/plain", 501)
             viewer = self.client_address[0]
+            # A player first asks for index.m3u8 (the list of segments), then fetches
+            # each segNNNNN.ts it lists, and re-asks for index.m3u8 every few seconds
+            # to learn about new ones. Each request also says "this viewer is still here".
             if name == "index.m3u8":
                 if ch.kind != "ota" and not tablo.maybe_reconnect(min_gap=15):
                     return self.send_body(b"FAST channels need the internet.", "text/plain", 503)
@@ -1409,6 +1944,8 @@ def make_handler(tablo: Tablo, favs: Favorites, port: int):
                     log.error(f"[{ch.display_name}] could not tune for browser: {e}")
                     return self.send_body(b"Tablo could not tune (all tuners busy?)", "text/plain", 503)
                 playlist = job.folder / "index.m3u8"
+                # Wait (up to ~25 s) for ffmpeg's first segment: answering with an empty
+                # playlist makes some players give up instead of retrying.
                 for _ in range(100):                      # first segments take a few seconds
                     if playlist.exists() and b".ts" in playlist.read_bytes():
                         break
@@ -1417,7 +1954,11 @@ def make_handler(tablo: Tablo, favs: Favorites, port: int):
                     time.sleep(0.25)
                 else:
                     return self.send_body(b"Still starting; try again", "text/plain", 503)
-                return self.send_body(playlist.read_bytes(), "application/vnd.apple.mpegurl", cors=True)
+                body = playlist.read_bytes()
+                if S.access_key:     # players don't send cookies for segments: add ?key= to each
+                    body = re.sub(rb"(?m)^(seg\d+\.ts)$", lambda m: m.group(1) + kq().encode(), body)
+                return self.send_body(body, "application/vnd.apple.mpegurl", cors=True)
+            name = name.split("?")[0]
             if re.fullmatch(r"seg\d+\.ts", name):
                 job = live.get(ident, q)
                 seg = job.folder / name if job else None
@@ -1429,12 +1970,13 @@ def make_handler(tablo: Tablo, favs: Favorites, port: int):
             self.send_error(404)
 
         def target_url(self, ident: str, host: str):
+            """Link (and label) for a channel, 'all' or 'favorites', on the given host."""
             if ident == "all":
-                return f"http://{host}/playlist.m3u", "all channels"
+                return f"http://{host}/playlist.m3u{kq()}", "all channels"
             if ident == "favorites":
-                return f"http://{host}/favorites.m3u", "favorites"
+                return f"http://{host}/favorites.m3u{kq()}", "favorites"
             ch = tablo.by_id(ident)
-            return (f"http://{host}/ch/{ident}", ch.display_name) if ch else (None, None)
+            return (f"http://{host}/ch/{ident}{kq()}", ch.display_name) if ch else (None, None)
 
         def play(self, ident: str):
             """Open the channel in VLC on this PC (only for requests from this PC)."""
@@ -1446,12 +1988,13 @@ def make_handler(tablo: Tablo, favs: Favorites, port: int):
             ch = tablo.by_id(ident)
             meta = vlc_meta(ch, tablo.now_playing().get(ident)) if ch else None
             if not launch_player(url, meta, playlist=ident in ("all", "favorites")):
-                why = ("ffplay can't open a channel list; pick a single channel." if PLAYER
+                why = ("ffplay can't open a channel list; pick a single channel." if S.player
                        else "No video player found. Install VLC or ffmpeg (ffplay).")
                 return self.send_body(why.encode(), "text/plain", 500)
             self.send_body(f"Opening {label} in {player_name()}".encode(), "text/plain")
 
         def single_m3u(self, ident: str):
+            """A one-channel playlist file (for devices that can't be told to open VLC)."""
             host = self.headers.get("Host", f"127.0.0.1:{port}")
             url, label = self.target_url(ident, host)
             if not url:
@@ -1469,18 +2012,22 @@ def make_handler(tablo: Tablo, favs: Favorites, port: int):
             self.wfile.write(body)
 
         def do_POST(self):
+            """POST /play/<id>: open a channel in the player on this PC (from the web page)."""
+            if not self.authorized():
+                return self.deny()
             if self.path.startswith("/play/"):
-                return self.play(urllib.parse.unquote(self.path[6:]))
+                return self.play(urllib.parse.unquote(self.path.split("?")[0][6:]))
             self.send_error(404)
 
         def playlist(self, all_channels: bool):
+            """VLC playlist: favorites, local, FAST, with show titles and VLC tuning options."""
             host = self.headers.get("Host", f"127.0.0.1:{port}")
             lines = ["#EXTM3U"]
 
             now = tablo.now_playing()
 
             def add(ch, group):
-                lines.extend(m3u_entry(ch, now.get(ch.identifier), f"http://{host}/ch/{ch.identifier}", group))
+                lines.extend(m3u_entry(ch, now.get(ch.identifier), f"http://{host}/ch/{ch.identifier}{kq()}", group))
 
             for ch in favs.channels():
                 add(ch, "Favorites")
@@ -1492,6 +2039,9 @@ def make_handler(tablo: Tablo, favs: Favorites, port: int):
             self.send_body(("\n".join(lines) + "\n").encode(), "audio/x-mpegurl")
 
         def stream(self, ident: str):
+            """/ch/<id>: tune a channel for VLC. Without ffmpeg, redirect VLC straight to
+            the Tablo's stream; with ffmpeg, relay it unchanged. Either way, switching
+            channels on the same device first frees that device's previous tuner."""
             ch = tablo.by_id(ident)
             if not ch:
                 return self.send_error(404, "Unknown channel")
@@ -1510,7 +2060,7 @@ def make_handler(tablo: Tablo, favs: Favorites, port: int):
                 sessions[viewer] = token
 
             log.debug(f"[{ch.display_name}] Tablo stream URL: {url}")
-            if not USE_FFMPEG:
+            if not S.use_ffmpeg:
                 # Hand VLC the Tablo's HLS URL; VLC keeps polling it, which
                 # keeps the Tablo session alive while you watch.
                 log.info(f"[{ch.display_name}] tuned, VLC playing directly")
@@ -1554,6 +2104,7 @@ def make_handler(tablo: Tablo, favs: Favorites, port: int):
                 log.info(f"[{ch.display_name}] stopped")
 
     def end_all():
+        """Free every tuner we're holding (used when the script quits)."""
         live.stop_all()
         with sessions_lock:
             tokens = list(sessions.values())
@@ -1565,19 +2116,29 @@ def make_handler(tablo: Tablo, favs: Favorites, port: int):
     return Handler
 
 
-# ----------------------------------------------------------------------
-# Commands
-# ----------------------------------------------------------------------
+# =============================================================================
+# SECTION 10: PLAYERS + COMMANDS
+# --setup, printed VLC commands, and finding/launching VLC, ffplay or mpv.
+# =============================================================================
 def cmd_setup(cfg):
+    """--setup: ask for the Tablo email and password, save, and test the login."""
     t = cfg["tablo"]
     t["email"] = input(f"Tablo account email [{t.get('email', '')}]: ").strip() or t.get("email", "")
     pw = getpass.getpass("Tablo password (blank = keep current): ")
     if pw:
         t["password"] = pw
+        if keyring_available():
+            ans = input("Keep the password in your system keyring instead of tablo.ini? [y/N]: ")
+            if ans.strip().lower().startswith("y"):
+                if keyring_set(t["email"], pw):
+                    t["password"] = "keyring"
+                    print("Stored in your keyring; tablo.ini now says 'password = keyring'.")
+                else:
+                    print("Couldn't use the keyring; saving the password in tablo.ini instead.")
     t.setdefault("port", str(DEFAULT_PORT))
     save_config(cfg)
     try:
-        Tablo(t["email"], t["password"])  # verify login works
+        Tablo(t["email"], get_password(t))  # verify login works
     except Exception as e:
         log.error(f"Saved your login, but could not connect to Tablo: {e}")
         sys.exit(1)
@@ -1586,7 +2147,7 @@ def cmd_setup(cfg):
 
 def print_vlc_commands(tablo: "Tablo", port: int) -> None:
     """One VLC command per local OTA channel, via this script's server."""
-    lines = [f"VLC commands for local OTA channels (this script must be running):"]
+    lines = ["VLC commands for local OTA channels (this script must be running):"]
     for ch in tablo.ota:
         label = f"{ch.display_name}" + (f" ({ch.network})" if ch.network else "")
         lines.append(f"  {label:<28} vlc http://127.0.0.1:{port}/ch/{ch.identifier}")
@@ -1605,10 +2166,6 @@ def m3u_entry(ch, a, url: str, group: str) -> list:
     return lines + [url]
 
 
-PLAYER: dict | None = None   # set in main() by resolve_player()
-VLC_BUFFER_MS = 3000         # VLC network buffer for live TV (tablo.ini vlc_buffer / --buffer)
-DEINTERLACE = "yadif2x"      # VLC deinterlace mode for interlaced broadcasts; "off" = none
-_last_player_proc = None     # ffplay: close the old window when switching channels
 
 
 FLATPAK_VLC_ID = "org.videolan.VLC"
@@ -1711,7 +2268,8 @@ def resolve_player(setting: str = "") -> dict | None:
 
 
 def player_name() -> str:
-    return PLAYER["name"] if PLAYER else "VLC"
+    """Name of the chosen player for messages ('VLC', 'ffplay', ...)."""
+    return S.player["name"] if S.player else "VLC"
 
 
 class VLCControl:
@@ -1720,14 +2278,17 @@ class VLCControl:
     replaced, not added to. Falls back to closing and reopening VLC."""
 
     def __init__(self):
+        """No VLC yet; it's started on the first channel you pick."""
         self.proc = None
         self.port = 0
         self.pw = ""
 
     def _alive(self) -> bool:
+        """Our VLC window is still open."""
         return bool(self.proc and self.proc.poll() is None)
 
     def _cmd(self, path: str) -> bool:
+        """Send one command to our VLC through its web remote (localhost + password)."""
         req = urllib.request.Request(f"http://127.0.0.1:{self.port}/requests/status.json?{path}")
         req.add_header("Authorization", "Basic " + __import__("base64").b64encode(f":{self.pw}".encode()).decode())
         try:
@@ -1738,6 +2299,8 @@ class VLCControl:
             return False
 
     def play(self, base_cmd: list, url: str, options: dict, title: str) -> bool:
+        """Play url in our VLC window: replace what's playing if VLC is open,
+        otherwise start VLC (with its web remote on a free local port)."""
         if self._alive():
             q = urllib.parse.urlencode([("command", "in_play"), ("input", url), ("name", title or url)]
                                        + [("option", f"{k}={v}") for k, v in options.items()],
@@ -1764,36 +2327,35 @@ def launch_player(url: str, meta: dict | None = None, playlist: bool = False, de
     """Open url in the chosen player. meta = guide info (title/description).
     VLC: one window, channel replaced on each pick. ffplay: old window closed first.
     detach=True (--play): a plain VLC launch that outlives the script."""
-    global _last_player_proc
-    if not PLAYER:
+    if not S.player:
         log.warning("No video player found. Install VLC (sudo apt install vlc, or "
                     "flatpak install flathub org.videolan.VLC) or ffmpeg, which includes ffplay "
                     "(sudo apt install ffmpeg), or set 'player =' in tablo.ini.")
         return False
-    kind, title = PLAYER["kind"], (meta or {}).get("meta-title", "")
+    kind, title = S.player["kind"], (meta or {}).get("meta-title", "")
     if playlist and kind == "ffplay":
         log.warning("ffplay can't open a channel list; pick a single channel instead "
                     "(or install VLC for playlists).")
         return False
-    log.info(f"Launching: {PLAYER['name']} {url}" + (f"  [{title}]" if title else ""))
+    log.info(f"Launching: {S.player['name']} {url}" + (f"  [{title}]" if title else ""))
     if kind == "vlc":
         options = {**(meta or {}), **vlc_tuning()}
         if not detach:
-            return VLC.play(PLAYER["cmd"], url, options, title)
-        cmd = [*PLAYER["cmd"], "--one-instance", url, *[f":{k}={v}" for k, v in options.items()]]
+            return VLC.play(S.player["cmd"], url, options, title)
+        cmd = [*S.player["cmd"], "--one-instance", url, *[f":{k}={v}" for k, v in options.items()]]
     elif kind == "ffplay":
-        cmd = [*PLAYER["cmd"], "-hide_banner", "-loglevel", "error",
+        cmd = [*S.player["cmd"], "-hide_banner", "-loglevel", "error",
                "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "10",
                "-window_title", title or "Tablo", url]
-        if _last_player_proc and _last_player_proc.poll() is None:
-            _last_player_proc.terminate()   # one window at a time, like VLC
+        if S.last_ffplay and S.last_ffplay.poll() is None:
+            S.last_ffplay.terminate()   # one window at a time, like VLC
     elif kind == "mpv":
-        cmd = [*PLAYER["cmd"], *([f"--force-media-title={title}"] if title else []), url]
+        cmd = [*S.player["cmd"], *([f"--force-media-title={title}"] if title else []), url]
     else:
-        cmd = [*PLAYER["cmd"], url]
+        cmd = [*S.player["cmd"], url]
     proc = spawn(cmd)
     if kind == "ffplay":
-        _last_player_proc = proc
+        S.last_ffplay = proc
     return True
 
 
@@ -1821,6 +2383,11 @@ def shutdown(server) -> None:
     log.info("Stopped.")
 
 
+# =============================================================================
+# SECTION 11: TERMINAL MENU
+# The numbered channel list in columns, colors, the details view, and the
+# menu loop (menu()). Channel numbers typed here map to Channel objects.
+# =============================================================================
 def ordered(tablo: "Tablo", favs: "Favorites"):
     """(section, channels) in display order: favorites, then the rest."""
     return [("Favorites", favs.channels()),
@@ -1829,6 +2396,7 @@ def ordered(tablo: "Tablo", favs: "Favorites"):
 
 
 def menu_numbers(tablo, favs):
+    """{menu number: channel} in the same order the menu shows them."""
     nums, n = {}, 0
     for _, chans in ordered(tablo, favs):
         for c in chans:
@@ -1894,8 +2462,6 @@ def change_favs(tablo, favs, items, add: bool, numbered=None) -> None:
         print(f"Saved to {CONFIG_FILE.name}")
 
 
-COLUMNS = 0  # 0 = fit the terminal width; set by --columns
-USE_COLOR = sys.stdout.isatty() and not os.environ.get("NO_COLOR") and enable_windows_ansi()  # --no-color turns off
 
 # ANSI styles for the terminal list
 LIGHT_BLUE = "\033[1;38;5;117m"  # bold light blue (256-color terminals, which Ubuntu's are)
@@ -1909,7 +2475,8 @@ RESET = "\033[0m"
 
 
 def paint(text: str, style: str) -> str:
-    return f"{style}{text}{RESET}" if USE_COLOR and style else text
+    """Color text for the terminal (if colors are on)."""
+    return f"{style}{text}{RESET}" if S.use_color and style else text
 
 
 def short_name(ch) -> str:
@@ -1918,6 +2485,7 @@ def short_name(ch) -> str:
 
 
 def clip(text: str, width: int) -> str:
+    """Shorten text to width, ending with an ellipsis if it was cut."""
     return text if len(text) <= width else text[:max(1, width - 1)] + "…"
 
 
@@ -1928,7 +2496,7 @@ def print_columns(cells, now=None, fav=False) -> None:
     width = shutil.get_terminal_size((100, 24)).columns
     fixed = 5 + 7 + 2                     # " 12) " + "702.1  " + gap between columns
     min_name, max_name = (26, 44) if now else (14, 24)
-    cols = COLUMNS or max(1, (width - 2) // (fixed + min_name))
+    cols = S.columns or max(1, (width - 2) // (fixed + min_name))
     cols = min(cols, max(1, len(cells)))
     name_w = max(min_name, min(max_name, (width - 2) // cols - fixed))
 
@@ -2050,6 +2618,8 @@ def lan_ip(towards: str = "") -> str:
 
 
 def start_server(tablo, favs, port, lan):
+    """Start the web server in a background thread. lan=True listens on every
+    network interface (other devices), otherwise only on this PC."""
     bind = "0.0.0.0" if lan else "127.0.0.1"
     try:
         server = ThreadingHTTPServer((bind, port), make_handler(tablo, favs, port))
@@ -2062,6 +2632,7 @@ def start_server(tablo, favs, port, lan):
 
 
 def menu(tablo, favs, port, web):
+    """The interactive channel menu (the default when you just run the script)."""
     base = f"http://127.0.0.1:{port}"
     show_streaming = not tablo.lan_only   # FAST can't play in --offline mode
     numbered = print_channels(tablo, favs, show_streaming)
@@ -2159,7 +2730,102 @@ other devices (start the script with --lan; the PC needs ffmpeg for these):
 """
 
 
-def main():
+# =============================================================================
+# SECTION 12: STARTUP (main)
+# main() runs these steps in order; each is its own function below:
+#   build_parser -> apply_display_options -> load_login -> connect_tablo ->
+#   apply_playback_settings -> run_one_shot (--list, --play...) -> announce ->
+#   serve (web server + menu). The keyring and guide-refresher helpers they
+#   use come first.
+# =============================================================================
+
+# --- Optional system keyring for the password --------------------------------
+# 'password = keyring' in tablo.ini means: the real password is in your desktop's
+# keyring (GNOME Keyring / KWallet via secret-tool or the Python 'keyring' module,
+# Windows Credential Manager or macOS Keychain via 'keyring'). Nothing to install
+# if you don't use it; a plain password in tablo.ini keeps working.
+KEYRING_SERVICE = "tablo-vlc"
+
+
+def _keyring_module():
+    """The optional Python 'keyring' package, or None if it isn't installed."""
+    try:
+        import keyring          # optional: pip install keyring
+        return keyring
+    except Exception:
+        return None
+
+
+def keyring_available() -> bool:
+    """True if some keyring can be used on this PC."""
+    return bool(_keyring_module() or shutil.which("secret-tool"))
+
+
+def keyring_get(email: str) -> str:
+    """The Tablo password stored for this email, or '' (tries 'keyring', then secret-tool)."""
+    kr = _keyring_module()
+    if kr:
+        try:
+            return kr.get_password(KEYRING_SERVICE, email) or ""
+        except Exception as e:
+            log.debug(f"keyring lookup failed: {e}")
+    if shutil.which("secret-tool"):
+        r = subprocess.run(["secret-tool", "lookup", "service", KEYRING_SERVICE, "account", email],
+                           stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)
+        if r.returncode == 0:
+            return r.stdout.rstrip("\n")
+    return ""
+
+
+def keyring_set(email: str, password: str) -> bool:
+    """Store the password; True if it worked. secret-tool reads it from stdin,
+    so it never appears in a command line or the process list."""
+    kr = _keyring_module()
+    if kr:
+        try:
+            kr.set_password(KEYRING_SERVICE, email, password)
+            return True
+        except Exception as e:
+            log.debug(f"keyring store failed: {e}")
+    if shutil.which("secret-tool"):
+        r = subprocess.run(["secret-tool", "store", "--label", "Tablo account (tablo-vlc)",
+                            "service", KEYRING_SERVICE, "account", email],
+                           input=password, capture_output=True, text=True, timeout=60)
+        return r.returncode == 0
+    return False
+
+
+def get_password(t) -> str:
+    """The Tablo password: from tablo.ini, or the system keyring if it says 'keyring'."""
+    pw = t.get("password", "")
+    if pw.strip().lower() != "keyring":
+        return pw
+    pw = keyring_get(t["email"])
+    if not pw:
+        sys.exit("tablo.ini says 'password = keyring' but your keyring has no Tablo password\n"
+                 f"for {t['email']}. Run: {RUN} --setup")
+    register_secret(pw)
+    return pw
+
+
+def start_guide_refresher(tablo, favs) -> None:
+    """Build /guide.xml now in the background and rebuild it every 30 minutes,
+    so IPTV apps (TiviMate, IPTV Smarters...) never wait on dozens of cloud calls."""
+    def loop():
+        while True:
+            try:
+                first = not _xmltv_cache["xml"]
+                build_xmltv(tablo, favs)
+                if first:
+                    log.info("TV guide ready for IPTV apps (/guide.xml)")
+            except Exception as e:                   # offline / cloud down: keep the old copy
+                log.debug(f"Guide refresh skipped: {e}")
+            time.sleep(GUIDE_REFRESH)
+    threading.Thread(target=loop, name="guide-refresher", daemon=True).start()
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """All command-line options (shown by --help, with HELP_EPILOG at the end)."""
     ap = argparse.ArgumentParser(
         description="Watch Tablo 4th Gen live TV on this PC, phones, tablets and TVs. "
                     "With no options, shows a channel menu.",
@@ -2184,8 +2850,11 @@ def main():
     ap.add_argument("--player", metavar="NAME",
                     help="video player for this run: vlc, flatpak, ffplay, mpv, or a full command (overrides tablo.ini)")
     ap.add_argument("--ffplay", action="store_true", help="shortcut for --player ffplay")
+    ap.add_argument("--encoder", metavar="NAME",
+                    help="phone/TV video encoder for this run: auto, x264, vaapi, nvenc, qsv, amf")
     ap.add_argument("--buffer", type=int, metavar="MS",
-                    help="VLC buffer in milliseconds for this run (default from tablo.ini or 3000)")
+                    help=f"VLC buffer in milliseconds for this run (default from tablo.ini or "
+                         f"{DEFAULT_VLC_BUFFER}); try 10000 if Wi-Fi hiccups cause stutters")
     ap.add_argument("--vlc", action="store_true", help="shortcut for --player vlc")
     ap.add_argument("--tune", metavar="CH", help="print a one-time VLC command for the Tablo's raw stream")
     ap.add_argument("--vlc-commands", action="store_true",
@@ -2199,31 +2868,41 @@ def main():
     ap.add_argument("--columns", type=int, metavar="N", help="channel list columns (default: fit the window)")
     ap.add_argument("--no-color", action="store_true", help="plain text channel list (no colors)")
     ap.add_argument("--debug", action="store_true", help="show detailed messages on screen too")
-    args = ap.parse_args()
+    ap.add_argument("--debug-raw", action="store_true",
+                    help="like --debug but log tokens unredacted (don't share that log!)")
+    return ap
+
+
+def apply_display_options(args) -> None:
+    """Step 1: logging, terminal columns/colors, and whether ffmpeg can relay streams."""
     if args.favorites and not args.play:
-        args.play = "favorites"
-    setup_logging(args.debug)
-    global COLUMNS
-    COLUMNS = max(0, args.columns or 0)
-    global USE_COLOR
+        args.play = "favorites"                      # old --favorites alias
+    setup_logging(args.debug or args.debug_raw, raw=args.debug_raw)
+    if args.debug_raw:
+        log.warning("--debug-raw: tokens are written to the log unredacted. Don't share this log.")
+    S.columns = max(0, args.columns or 0)
     if args.no_color:
-        USE_COLOR = False
+        S.use_color = False
+    S.use_ffmpeg = bool(shutil.which("ffmpeg")) and not args.direct
     log.debug(f"Started: {' '.join(sys.argv)}")
 
-    global USE_FFMPEG
-    USE_FFMPEG = bool(shutil.which("ffmpeg")) and not args.direct
 
+def load_login(args):
+    """Step 2: tablo.ini, your login and the Tablo signing keys.
+    Returns (cfg, section), or None when a command like --setup has finished."""
     cfg = load_config()
     t = cfg["tablo"]
     if args.setup:
         cmd_setup(cfg)
         print("Add your favorites to tablo.ini (e.g. favorites = 4.1, 9.1), then run with no options.")
-        return
+        return None
     if not t.get("email") or not t.get("password"):
         if not CONFIG_FILE.exists():
             save_config(cfg)  # create a blank template to fill in
         sys.exit(f"Add your Tablo email and password to:\n  {CONFIG_FILE}\n"
                  f"then run this again. (Or run with --setup to be prompted.)")
+    # The signing keys come from tablo.ini, or are downloaded once from the
+    # open-source tablo-api project (never in --offline mode).
     if args.offline and not args.fetch_keys and not load_keys(t):
         sys.exit(f"--offline needs the Tablo signing keys in {CONFIG_FILE.name}, and they can't be "
                  f"downloaded without the internet. Run once without --offline first.")
@@ -2237,11 +2916,15 @@ def main():
                      f"{CONFIG_FILE.name}:\n  hash_key = ...\n  device_key = ...\n"
                      f"(copy the values from tablo-api's tablo_api/auth.py on GitHub).")
         if args.fetch_keys:
-            return
+            return None
+    return cfg, t
 
+
+def connect_tablo(args, t) -> "Tablo":
+    """Step 3: log in to the Tablo cloud, or start from the saved channel list."""
     try:
-        tablo = Tablo(t["email"], t["password"], t.get("device", ""),
-                      lan_only=args.offline, tablo_ip=args.tablo_ip or "")
+        return Tablo(t["email"], get_password(t), t.get("device", ""),
+                     lan_only=args.offline, tablo_ip=args.tablo_ip or "")
     except NetworkError as e:
         if args.offline:
             sys.exit(f"--offline: {e}")
@@ -2251,60 +2934,61 @@ def main():
     except Exception as e:
         log.error(f"Could not connect to Tablo: {e}")
         sys.exit(f"See {LOG_FILE} for details.")
+
+
+def apply_playback_settings(args, cfg, t) -> int:
+    """Step 4: port, VLC tuning, picture quality, access key and player. Returns the port."""
     if t.get("port", "").strip() == "8089":  # old default the script wrote itself
         t["port"] = str(DEFAULT_PORT)
         save_config(cfg)
         log.info(f"Changed port in {CONFIG_FILE.name} from 8089 to {DEFAULT_PORT}")
-    port = args.port or int(t.get("port", DEFAULT_PORT))
-    favs = Favorites(cfg, tablo)
-    global PLAYER
-    global VLC_BUFFER_MS, DEINTERLACE
     try:
-        VLC_BUFFER_MS = max(300, int(args.buffer or t.get("vlc_buffer", "") or VLC_BUFFER_MS))
+        S.vlc_buffer_ms = max(300, int(args.buffer or t.get("vlc_buffer", "") or S.vlc_buffer_ms))
     except ValueError:
-        log.warning(f"vlc_buffer in {CONFIG_FILE.name} should be a number of milliseconds; using {VLC_BUFFER_MS}")
-    DEINTERLACE = (t.get("deinterlace", "") or DEINTERLACE).strip().lower()
-    global BROWSER_QUALITY
-    global TV_QUALITY
+        log.warning(f"vlc_buffer in {CONFIG_FILE.name} should be a number of milliseconds; using {S.vlc_buffer_ms}")
+    S.deinterlace = (t.get("deinterlace", "") or S.deinterlace).strip().lower()
     for name in ("browser_quality", "tv_quality"):
         try:
             val = int(t.get(name, "") or 0)
             if val:
                 val = min(QUALITIES, key=lambda q: abs(q - val))   # nearest supported height
-                if name == "browser_quality":
-                    BROWSER_QUALITY = val
-                else:
-                    TV_QUALITY = val
+                setattr(S, name, val)
         except ValueError:
             log.warning(f"{name} in {CONFIG_FILE.name} should be a number like 720 or 1080")
+    S.encoder_setting = (args.encoder or t.get("encoder", "") or "auto").strip().lower()
+    S.access_key = t.get("access_key", "").strip()
+    register_secret(S.access_key)          # never show the key in the log
     choice = args.player or ("ffplay" if args.ffplay else "vlc" if args.vlc else t.get("player", ""))
-    PLAYER = resolve_player(choice)
-    if PLAYER:
-        log.debug(f"Player: {PLAYER['name']} ({' '.join(PLAYER['cmd'])})")
+    S.player = resolve_player(choice)
+    if S.player:
+        log.debug(f"Player: {S.player['name']} ({' '.join(S.player['cmd'])})")
     else:
         log.warning("No video player found (VLC or ffplay). Channels will list, but can't play here. "
                     "Install one: sudo apt install vlc   (or: sudo apt install ffmpeg)")
+    return args.port or int(t.get("port", DEFAULT_PORT))
 
-    # ---- one-shot commands
+
+def run_one_shot(args, tablo, favs, port) -> bool:
+    """Step 5: commands that do one thing and exit. True if one ran."""
     if args.add_fav or args.remove_fav:
         if args.add_fav:
             change_favs(tablo, favs, args.add_fav, add=True)
         if args.remove_fav:
             change_favs(tablo, favs, args.remove_fav, add=False)
         print("Favorites: " + (", ".join(c.display_name for c in favs.channels()) or "(none)"))
-        return
+        return True
     if args.list:
         print_channels(tablo, favs, show_streaming=True)
-        return
+        return True
     if args.info:
         ch = resolve(tablo, favs, args.info)
         if not ch:
             sys.exit(f"Channel '{args.info}' not found. Try --list.")
         show_info(tablo, ch)
-        return
+        return True
     if args.vlc_commands:
         print_vlc_commands(tablo, port)
-        return
+        return True
     if args.tune:
         ch = tablo.find(args.tune)
         if not ch:
@@ -2313,60 +2997,92 @@ def main():
         log.info(f"[{ch.display_name}] Tablo stream URL: {url}")
         print("\nPlay it straight from the Tablo (start within a minute or so; the")
         print("Tablo keeps it going while VLC is watching):\n")
-        print(f'  vlc "{url}"\n')
-        return
-
-    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
-    base = f"http://127.0.0.1:{port}"
-
-    # ---- --play: one channel exits right away; a playlist needs the server
+        print(f'  vlc "{url}"\n')       # the real URL on screen; the log gets a fingerprint
+        return True
+    # --play <one channel>: tune, hand it to the player, exit (no server needed)
     if args.play and args.play.lower() not in ("all", "favorites", "favs", "fav"):
-        want = args.play
-        ch = resolve(tablo, favs, want)
+        ch = resolve(tablo, favs, args.play)
         if not ch:
-            sys.exit(f"Channel '{want}' not found. Try --list.")
+            sys.exit(f"Channel '{args.play}' not found. Try --list.")
         sys.exit(0 if play_direct(tablo, ch) else 1)
+    return False
 
-    server = start_server(tablo, favs, port, args.lan)
-    log.info(f"Player: {player_name() if PLAYER else 'none found'}   Stream mode: "
-             + ("ffmpeg relay" if USE_FFMPEG else "direct") + f"   Log: {LOG_FILE}")
-    if args.web or args.lan:
-        if not args.offline:
-            threading.Thread(target=ensure_hls_js, daemon=True).start()
+
+def announce(args, tablo, port) -> None:
+    """Step 6: tell you where things are (and get the phone/TV extras ready)."""
+    base = f"http://127.0.0.1:{port}"
+    log.info(f"Player: {player_name() if S.player else 'none found'}   Stream mode: "
+             + ("ffmpeg relay" if S.use_ffmpeg else "direct") + f"   Log: {LOG_FILE}")
+    if (args.web or args.lan) and not args.offline:
+        threading.Thread(target=ensure_hls_js, daemon=True).start()
+    # This PC's address on the home network (the one that reaches the Tablo),
+    # so you know what to type on a phone/TV, or which IP to reserve in your router.
+    my_ip = lan_ip(tablo.device_url)
+    tablo_host = urllib.parse.urlsplit(tablo.device_url).hostname if tablo.device_url else ""
+    log.info(f"This PC's local IP: {my_ip}"
+             + (f"   Tablo: {tablo_host}" if tablo_host else "")
+             + ("" if args.lan else f"   (other devices: start with --lan, then open http://{my_ip}:{port}/)"))
     if args.lan:
-        ip = lan_ip(tablo.device_url)
-        global LAN_BASE
-        LAN_BASE = f"http://{ip}:{port}"
-        log.info(f"Phones/tablets on your Wi-Fi: open {LAN_BASE}/ in Safari or Chrome"
+        S.lan_base = f"http://{my_ip}:{port}"
+        log.info(f"Phones/tablets on your Wi-Fi: open {S.lan_base}/{kq()} in Safari or Chrome"
                  + ("" if LiveTV.available() else "  (install ffmpeg on this PC for in-browser playback)"))
         if LiveTV.available():
-            log.info(f"TVs (Fire TV Silk, Samsung Internet, Google TV browser): {LAN_BASE}/tv")
-            log.info(f"IPTV apps (TiviMate, UHF, iPlayTV, Kodi): playlist {LAN_BASE}/tv.m3u  guide {LAN_BASE}/guide.xml")
+            log.info(f"TVs (Fire TV Silk, Samsung Internet, Google TV browser): {S.lan_base}/tv{kq()}")
+            log.info(f"IPTV apps (TiviMate, UHF, iPlayTV, Kodi): playlist {S.lan_base}/tv.m3u{kq()}  "
+                     f"guide {S.lan_base}/guide.xml{kq()}")
+        if not S.access_key:
+            log.info("Anyone on your Wi-Fi can watch. To require a key, set access_key = <something> in tablo.ini.")
         if IS_WINDOWS:
             log.info("If Windows asks, allow Python through the firewall on Private networks.")
     if args.web:
         log.info(f"Web page: {base}/")
         open_url(base + "/")
 
+
+def serve(args, tablo, favs, port) -> None:
+    """Steps 7-8: run the web server, plus the menu (normal run in a terminal),
+    a playlist (--play favorites/all), or nothing (--no-vlc / headless)."""
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    base = f"http://127.0.0.1:{port}"
+    server = start_server(tablo, favs, port, args.lan)
+    announce(args, tablo, port)
+    if args.lan and LiveTV.available():
+        threading.Thread(target=choose_encoder, daemon=True).start()   # ready before the first phone/TV
+        start_guide_refresher(tablo, favs)           # keep /guide.xml ready for IPTV apps
     if args.play:  # favorites / all playlist
-        which = "playlist.m3u" if args.play.lower() == "all" else "favorites.m3u"
-        launch_player(f"{base}/{which}", playlist=True)
+        launch_player(f"{base}/{'playlist.m3u' if args.play.lower() == 'all' else 'favorites.m3u'}",
+                      playlist=True)
         print("Keep this window open while watching. Ctrl+C to quit.")
     elif not args.no_vlc and sys.stdin.isatty():
-        if CONSOLE and not args.debug:
-            CONSOLE.setLevel(logging.WARNING)  # keep the menu tidy; everything still goes to the log
+        if S.console and not args.debug:
+            S.console.setLevel(logging.WARNING)      # keep the menu tidy; everything still goes to the log
         menu(tablo, favs, port, args.web)
         shutdown(server)
         return
     else:
         print(f"Server running at {base}/  Ctrl+C to quit.")
-
     try:
         while True:
             threading.Event().wait(3600)
     except KeyboardInterrupt:
         pass
     shutdown(server)
+
+
+def main():
+    """Command-line entry point. Each step is its own function above."""
+    args = build_parser().parse_args()
+    apply_display_options(args)                      # 1. logging, colors
+    loaded = load_login(args)                        # 2. tablo.ini, login, keys
+    if not loaded:
+        return
+    cfg, t = loaded
+    tablo = connect_tablo(args, t)                   # 3. Tablo cloud / saved list
+    port = apply_playback_settings(args, cfg, t)     # 4. player, quality, access key
+    favs = Favorites(cfg, tablo)
+    if run_one_shot(args, tablo, favs, port):        # 5. --list, --play 2.1, ...
+        return
+    serve(args, tablo, favs, port)                   # 6-8. server + menu
 
 
 if __name__ == "__main__":
