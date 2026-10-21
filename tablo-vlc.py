@@ -3,7 +3,8 @@
 
 Needs nothing but Python 3 (built into Ubuntu) and VLC. No install.
 Settings (email, password, favorites) live in tablo.ini next to this script;
-activity is logged to tablo-vlc.log in the same folder.
+activity is logged to tablo-vlc.log in the same folder. (Set the TABLO_VLC_DIR
+environment variable to keep them in another folder, e.g. for Docker.)
 
 Command line:
   ./tablo-vlc.py                 channel menu in the terminal; type a number to watch
@@ -211,6 +212,8 @@ from pathlib import Path
 # SECTION 1: PLATFORM HELPERS
 # Small differences between Linux and Windows, kept in one place.
 # =============================================================================
+__version__ = "1.2.0"        # shown by --version and at the top of the log
+
 IS_WINDOWS = os.name == "nt"
 # How to run this script, for help text: Windows uses the py launcher.
 RUN = "py tablo-vlc.py" if IS_WINDOWS else "./tablo-vlc.py"
@@ -277,11 +280,13 @@ class Settings:
         self.browser_quality = 720       # phones/tablets picture height (browser_quality)
         self.tv_quality = 1080           # TVs / Cast / IPTV apps picture height (tv_quality)
         self.guide_refresh = 10          # minutes between automatic guide refreshes; 0 = off
+        self.captions = False            # phone/TV pages start with closed captions showing
         self.encoder_setting = "auto"    # tablo.ini encoder: auto, x264, vaapi, nvenc, qsv, amf
         self.encoder = None              # encoder actually used (found on first use)
         self.lan_base = ""               # "http://<this PC's IP>:<port>" with --lan (for Cast)
         self.access_key = ""             # tablo.ini access_key: other devices need ?key=...
         self.columns = 0                 # menu columns; 0 = fit the window (--columns)
+        self.max_channels = 0            # channels listed in the menu; 0 = all (--max-channels)
         self.use_color = (sys.stdout.isatty() and not os.environ.get("NO_COLOR")
                           and enable_windows_ansi())   # --no-color turns off
         self.console = None              # the on-screen log handler (quieted during the menu)
@@ -292,12 +297,17 @@ class Settings:
 S = Settings()
 
 
-# Config lives next to this script: same folder as tablo-vlc.py
-CONFIG_FILE = Path(__file__).resolve().parent / "tablo.ini"
-LOG_FILE = Path(__file__).resolve().parent / "tablo-vlc.log"
+# Config lives next to this script: same folder as tablo-vlc.py. The environment
+# variable TABLO_VLC_DIR can point somewhere else instead (Docker uses /data, so the
+# settings survive updating the container; a system service can use it too).
+DATA_DIR = Path(os.environ.get("TABLO_VLC_DIR") or Path(__file__).resolve().parent).expanduser()
+if os.environ.get("TABLO_VLC_DIR"):
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+CONFIG_FILE = DATA_DIR / "tablo.ini"
+LOG_FILE = DATA_DIR / "tablo-vlc.log"
 # Saved copy of your Tablo's address + channel list (+ last guide info) so the
 # script still starts and plays local channels when the internet is down.
-CACHE_FILE = Path(__file__).resolve().parent / "tablo-cache.json"
+CACHE_FILE = DATA_DIR / "tablo-cache.json"
 
 CONFIG_HEADER = """\
 # tablo-vlc settings. Edit with any text editor.
@@ -312,6 +322,11 @@ CONFIG_HEADER = """\
 #   deinterlace      : VLC deinterlace mode for 1080i broadcasts: yadif2x (default), yadif, bob, off
 #   browser_quality  : max picture height when watching in a phone/tablet browser: 480, 720 (default), 1080
 #   tv_quality       : max picture height for TVs, Cast and IPTV apps: 720, 1080 (default)
+#   max_channels     : list at most this many channels in the menu (0 = all, the default).
+#                      Favorites always show. Same as --max-channels for one run
+#   captions         : on = phone and TV web pages start with closed captions showing
+#                      (default off; turn them on/off while watching: the player's CC
+#                      button on phones, ◀ or ▶ on the TV page). VLC: Subtitle menu
 #   guide_refresh    : minutes between automatic "what's on" refreshes for the menu and
 #                      the web pages (default 10; 0 = off). Refresh by hand any time:
 #                      r in the menu, the Refresh guide button, or --refresh-guide
@@ -442,7 +457,7 @@ def save_config(cfg: configparser.ConfigParser) -> None:
     t = cfg["tablo"]
     for key, default in (("email", ""), ("password", ""), ("favorites", ""),
                          ("port", str(DEFAULT_PORT)), ("player", ""), ("vlc_buffer", str(DEFAULT_VLC_BUFFER)),
-                         ("deinterlace", "yadif2x"), ("browser_quality", "720"), ("tv_quality", "1080"), ("encoder", "auto"), ("guide_refresh", "10"), ("access_key", ""), ("smart_plug", ""), ("hash_key", ""), ("device_key", "")):
+                         ("deinterlace", "yadif2x"), ("browser_quality", "720"), ("tv_quality", "1080"), ("encoder", "auto"), ("guide_refresh", "10"), ("captions", "off"), ("max_channels", "0"), ("access_key", ""), ("smart_plug", ""), ("hash_key", ""), ("device_key", "")):
         t.setdefault(key, default)
     fd = os.open(CONFIG_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -721,6 +736,15 @@ class Tablo:
         self._last_try = 0.0
         self._timeout, self._retries = 10, 2
         self._login_lock = threading.Lock()         # one re-login at a time
+        # Tuners this script holds: {session token: {"ident", "who", "since"}}.
+        # Every tune goes through watch_session() and every release through
+        # end_session(), so this is exact for this script (not for recordings or
+        # the Tablo app on other TVs; see tuner_status()).
+        self.active: dict[str, dict] = {}
+        self._active_lock = threading.Lock()
+        self.tuner_total = int(self.cache.get("tuners") or 0)    # from /server/info
+        self.model = self.cache.get("model", "")
+        self.tuner_states = None      # [True/False per tuner] if the Tablo reports it
         if lan_only:
             if not self.cache.get("channels"):
                 raise NetworkError("No saved channel list yet. Run once with the internet connected "
@@ -982,6 +1006,17 @@ class Tablo:
         cache[ident] = (time.time(), out)
         return out
 
+    def remember_watched(self, ident: str) -> None:
+        """Note a channel you just watched (the 5 most recent are kept in
+        tablo-cache.json, so 'p' and the Recent line work across runs too)."""
+        recent = [ident] + [x for x in self.cache.get("recent", []) if x != ident]
+        self.cache["recent"] = recent[:5]
+        save_cache(self.cache)
+
+    def recent(self) -> list:
+        """Recently watched channels, newest first."""
+        return [ch for ch in (self.by_id(x) for x in self.cache.get("recent", [])) if ch]
+
     def upcoming(self, ident: str, count: int = 6) -> list:
         """Next few airings on one channel."""
         now = datetime.now(timezone.utc)
@@ -1048,6 +1083,8 @@ class Tablo:
         (instead of when the session times out)."""
         if not token:
             return
+        with self._active_lock:
+            self.active.pop(token, None)
         path = f"/player/sessions/{token}"
         auth, date = device_auth("DELETE", path)
         try:
@@ -1058,11 +1095,96 @@ class Tablo:
         except Exception as e:
             log.debug(f"Couldn't end Tablo session {token[:8]}…: {e}")
 
-    def watch_session(self, ident: str) -> tuple[str, str]:
-        """(stream URL, session token); token is '' for a FAST direct stream."""
+    def watch_session(self, ident: str, who: str = "") -> tuple[str, str]:
+        """(stream URL, session token); token is '' for a FAST direct stream.
+        who = what's watching (shown by the menu's tuner status)."""
         self._last_token = ""
         url = self.watch_url(ident)
-        return url, self._last_token
+        token = self._last_token
+        if token:                                    # a tuner is now ours
+            with self._active_lock:
+                self.active[token] = {"ident": ident, "who": who, "since": time.time()}
+        return url, token
+
+    # --- Tuner status ---------------------------------------------------------
+    def _device_get(self, path: str):
+        """Signed, read-only GET to the Tablo on your home network."""
+        auth, date = device_auth("GET", path)
+        return http("GET", f"{self.device_url}{path}?lh", {
+            "Authorization": auth, "Date": date, "Accept": "*/*", "User-Agent": LOCAL_UA},
+            timeout=5, retries=0)
+
+    def load_tuner_info(self) -> None:
+        """Ask the Tablo how many tuners it has (/server/info, the same request the
+        tablo-api and tablo2plex projects use). Also tries /server/tuners, which older
+        Tablos used to report which tuners are busy; if the 4th Gen answers it, the
+        menu can count recordings and other TVs too. Both are read-only; nothing is
+        tuned. Runs in the background at startup; the count is saved for offline use."""
+        try:
+            info = self._device_get("/server/info") or {}
+            model = info.get("model") or {}
+            if model.get("tuners"):
+                self.tuner_total = int(model["tuners"])
+                self.model = model.get("name") or self.model
+                self.cache.update(tuners=self.tuner_total, model=self.model)
+                save_cache(self.cache)
+                log.debug(f"Tablo model: {self.model}, {self.tuner_total} tuners")
+        except Exception as e:
+            log.debug(f"Couldn't read /server/info: {e}")
+        try:
+            raw = self._device_get("/server/tuners")
+            log.debug(f"/server/tuners answered: {str(raw)[:300]}")
+            if isinstance(raw, list) and raw and all(isinstance(t, dict) for t in raw):
+                states = [bool(t.get("in_use", t.get("inUse", t.get("busy")))) for t in raw
+                          if any(k in t for k in ("in_use", "inUse", "busy"))]
+                if len(states) == len(raw):
+                    self.tuner_states = states
+                    self.tuner_total = self.tuner_total or len(states)
+        except Exception as e:
+            log.debug(f"/server/tuners not available: {e}")
+
+    def tuner_status(self) -> dict:
+        """{'total': 4 or 0 if unknown, 'ours': [(channel, who, since)], 'busy': n or None}.
+        'busy' (all tuners in use, by anything) is only known if the Tablo reports it."""
+        with self._active_lock:
+            ours = [(self.by_id(a["ident"]), a["who"], a["since"]) for a in self.active.values()]
+        busy = None
+        if self.tuner_states is not None:
+            try:
+                fresh = self._device_get("/server/tuners")
+                self.tuner_states = [bool(t.get("in_use", t.get("inUse", t.get("busy")))) for t in fresh]
+            except Exception:
+                pass
+            busy = sum(self.tuner_states)
+        # FAST channels come from the internet and don't use an antenna tuner
+        return {"total": self.tuner_total, "ours": [o for o in ours if o[0] and o[0].kind == "ota"],
+                "busy": busy}
+
+    def tuner_summary(self) -> str:
+        """One line, e.g. 'Tuners: 2 of 4 in use by this script (9.1 KNINE, 4.1 KFOUR)'."""
+        st = self.tuner_status()
+        n, total = len(st["ours"]), st["total"]
+        names = ", ".join(f"{c.major}.{c.minor} {c.call_sign}" if c.major else c.call_sign for c, _, _ in st["ours"])
+        of = f" of {total}" if total else ""
+        if st["busy"] is not None:
+            others = max(0, st["busy"] - n)
+            line = f"Tuners: {st['busy']}{of} busy ({n} by this script" + (
+                f", {others} recording or on other TVs)" if others else ")")
+        else:
+            line = f"Tuners: {n}{of} in use by this script"
+        return line + (f" ({names})" if names else "")
+
+    def busy_hint(self) -> str:
+        """Extra words for a failed tune: who's holding tuners, as far as we know."""
+        st = self.tuner_status()
+        n, total = len(st["ours"]), st["total"]
+        if total and n >= total:
+            return (f" All {total} tuners are in use by this script; stop one "
+                    f"(close a player or switch channels) and try again.")
+        if total:
+            return (f" This script is using {n} of {total} tuners; the others are probably "
+                    f"recording or in use by the Tablo app on another TV.")
+        return " All tuners may be busy (recording, or in use on another TV)."
 
     def watch_url(self, ident: str) -> str:
         """Tune a channel, recovering from common problems: FAST channels fall back to
@@ -1264,7 +1386,7 @@ def tv_m3u(tablo, favs, host: str, favorites_only: bool = False) -> bytes:
 # browsers can't play. ffmpeg on this PC converts it on the fly to H.264/AAC HLS.
 # ----------------------------------------------------------------------
 HLS_JS_URL = "https://cdn.jsdelivr.net/npm/hls.js@1/dist/hls.min.js"
-HLS_JS_FILE = Path(__file__).resolve().parent / "tablo-hls.min.js"
+HLS_JS_FILE = DATA_DIR / "tablo-hls.min.js"
 
 
 def kq(sep: str = "?") -> str:
@@ -1295,6 +1417,10 @@ def ensure_hls_js() -> None:
 # laptops (battery, fans), headless boxes and several TVs at once. 'auto' tries
 # the ones that fit this OS with a tiny test encode and uses the first that works;
 # libx264 (software) always works as the fallback.
+# Closed captions: broadcasts carry them inside the MPEG-2 video (ATSC A/53, "CC1").
+# ffmpeg's decoder hands them to the encoder, and x264, NVENC, Quick Sync and VAAPI
+# copy them into the H.264 video by default, so phones/TVs can show them. AMF
+# (AMD on Windows) can't carry them: set encoder = x264 there if you need captions.
 ENCODERS = {
     "x264": {"label": "software (libx264)", "pre": [], "vf_tail": "",
              "codec": ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-maxrate", "5M",
@@ -1423,7 +1549,7 @@ class LiveTV:
         """(lock NOT held) Tune the Tablo and start ffmpeg converting that channel to
         H.264/AAC HLS in a temp folder: deinterlaced, scaled to q lines, 2-second segments."""
         ch = self.tablo.by_id(ident)
-        url, token = self.tablo.watch_session(ident)
+        url, token = self.tablo.watch_session(ident, who="phone/TV browser")
         folder = Path(tempfile.mkdtemp(prefix="tablo-live-"))
         height = max(240, min(int(q), 2160))
         encoder = choose_encoder()
@@ -1638,17 +1764,18 @@ h2{font-size:20px;letter-spacing:.08em;text-transform:uppercase;color:#9aa3b2;ma
 #ititle{font-size:32px;font-weight:700} #ishow{font-size:24px;color:#d5dbe6;margin-top:4px}
 #istate{font-size:20px;color:#87d7ff;margin-top:6px} .keys{font-size:16px;color:#9aa3b2;margin-top:10px}
 </style></head><body>
-<h1>Tablo TV</h1><p class="sub">Use the arrow keys and OK to pick a channel. While watching: ▲▼ or CH+/− change channel, OK shows info, Back returns here.</p>
+<h1>Tablo TV</h1><p class="sub">Use the arrow keys and OK to pick a channel. While watching: ▲▼ or CH+/− change channel, ◀ ▶ captions, OK shows info, Back returns here.</p>
 <div class="gbar"><button id="gref" class="gref">↻ Refresh guide</button><span class="asof">%%ASOF%%</span></div>
 %%NOTICE%%
 %%SECTIONS%%
 <div id="ov"><video id="v" playsinline autoplay x-webkit-airplay="allow"></video>
 <div id="info"><div id="ititle"></div><div id="ishow"></div><div id="istate"></div>
-<div class="keys">▲▼ / CH+ CH− change channel · OK info · Back close</div></div></div>
+<div class="keys">▲▼ / CH+ CH− change channel · ◀ ▶ captions on/off · OK info · Back close</div></div></div>
 <script src="/hls.min.js"></script>
 <script>
 const TVQ = %%TVQ%%, KEY = %%KEY%%;   // KEY: access key, if one is set in tablo.ini
 const GUIDE_MIN = %%GUIDE%%;          // tablo.ini guide_refresh (minutes; 0 = off)
+let ccOn = %%CC%%;                     // closed captions showing? (tablo.ini captions; ◀ ▶ toggle)
 const gref = document.getElementById("gref");
 const tiles = [...document.querySelectorAll(".tile")];
 const ov = document.getElementById("ov"), v = document.getElementById("v"), info = document.getElementById("info");
@@ -1667,13 +1794,24 @@ function play(i) {
   const src = "/live/" + encodeURIComponent(t.dataset.id) + "/" + TVQ + "/index.m3u8" + (KEY ? "?key=" + encodeURIComponent(KEY) : "");
   if (v.canPlayType("application/vnd.apple.mpegurl")) { v.src = src; }
   else if (window.Hls && Hls.isSupported()) {
-    hls = new Hls({liveSyncDurationCount: 3, manifestLoadingMaxRetry: 6, manifestLoadingRetryDelay: 1500});
+    hls = new Hls({liveSyncDurationCount: 3, manifestLoadingMaxRetry: 6, manifestLoadingRetryDelay: 1500,
+                   enableCEA708Captions: true});      // the broadcast's closed captions
     hls.on(Hls.Events.ERROR, (e, d) => { if (d.fatal) { istate.textContent = "Playback error (" + d.details + ")"; showInfo(10000); } });
     hls.loadSource(src); hls.attachMedia(v);
   } else { istate.textContent = "This TV browser can't play live video."; return; }
   v.play().catch(() => { istate.textContent = "Press OK / Play to start"; });
 }
 function close() { stop(); ov.style.display = "none"; try { document.exitFullscreen && document.fullscreenElement && document.exitFullscreen(); } catch (e) {} if (cur >= 0) tiles[cur].focus(); }
+// Closed captions: TV remotes have no CC button here, so ◀ or ▶ while watching turns them on/off.
+function ccTracks() { return [...v.textTracks].filter(t => t.kind === "captions" || t.kind === "subtitles"); }
+function applyCC() { ccTracks().forEach(t => t.mode = ccOn ? "showing" : "hidden"); }
+v.textTracks.addEventListener("addtrack", applyCC);
+function toggleCC() {
+  ccOn = !ccOn; applyCC();
+  istate.textContent = ccTracks().length ? (ccOn ? "Captions on" : "Captions off")
+                                         : (ccOn ? "Captions on (none on this channel yet)" : "Captions off");
+  showInfo(3000);
+}
 v.addEventListener("playing", () => { istate.textContent = ""; showInfo(4000); });
 v.addEventListener("waiting", () => { istate.textContent = "Buffering…"; });
 window.addEventListener("popstate", () => { if (ov.style.display === "block") close(); });
@@ -1706,6 +1844,7 @@ document.addEventListener("keydown", e => {
     if (k === "ArrowUp" || k === "PageUp" || k === "ChannelUp" || c === 427) { e.preventDefault(); play((cur - 1 + tiles.length) % tiles.length); return; }
     if (k === "ArrowDown" || k === "PageDown" || k === "ChannelDown" || c === 428) { e.preventDefault(); play((cur + 1) % tiles.length); return; }
     if (k === "Enter" || k === " " || k === "MediaPlayPause") { e.preventDefault(); if (v.paused) v.play(); showInfo(); return; }
+    if (k === "ArrowLeft" || k === "ArrowRight" || k === "Subtitle" || k === "c") { e.preventDefault(); toggleCC(); return; }
     return;
   }
   const dirs = {ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, -1], ArrowDown: [0, 1]};
@@ -1748,7 +1887,7 @@ def render_tv_page(tablo, favs) -> bytes:
         notice = '<div class="warn">No internet: local channels only.</div>'
     return fill(TV_PAGE, SECTIONS="".join(sections), NOTICE=notice,
                 TVQ=str(S.tv_quality), KEY=json.dumps(S.access_key),
-                GUIDE=str(0 if tablo.lan_only else S.guide_refresh),
+                GUIDE=str(0 if tablo.lan_only else S.guide_refresh), CC=json.dumps(S.captions),
                 ASOF=f"Guide as of {tablo.guide_time()}" if tablo.guide_time() else "").encode()
 
 
@@ -1807,7 +1946,8 @@ function watchHere(id, label) {
   if (video.canPlayType("application/vnd.apple.mpegurl")) {          // iPhone/iPad Safari
     video.src = src;
   } else if (window.Hls && Hls.isSupported()) {                        // Android Chrome, desktop
-    hls = new Hls({liveSyncDurationCount: 3, manifestLoadingMaxRetry: 6, manifestLoadingRetryDelay: 1500});
+    hls = new Hls({liveSyncDurationCount: 3, manifestLoadingMaxRetry: 6, manifestLoadingRetryDelay: 1500,
+                   enableCEA708Captions: true});      // the broadcast's closed captions
     hls.on(Hls.Events.ERROR, (e, d) => { if (d.fatal) pstate.textContent = "Playback error (" + d.details + ")"; });
     hls.loadSource(src); hls.attachMedia(video);
   } else {
@@ -1816,6 +1956,11 @@ function watchHere(id, label) {
   }
   video.play().catch(() => { pstate.textContent = "Tap ▶ to start"; });
 }
+// Closed captions show up as a text track once the video starts; the player's own
+// CC button turns them on/off. captions = on in tablo.ini starts with them showing.
+video.textTracks.addEventListener("addtrack", e => {
+  if (e.track.kind === "captions" || e.track.kind === "subtitles") e.track.mode = TABLO.cc ? "showing" : "hidden";
+});
 video.addEventListener("playing", () => pstate.textContent = "");
 video.addEventListener("waiting", () => pstate.textContent = "Buffering…");
 document.getElementById("pclose").onclick = () => { stopVideo(); player.style.display = "none"; };
@@ -1913,7 +2058,7 @@ def render_page(tablo: Tablo, favs: Favorites) -> bytes:
         note += (f' TVs: <a href="/tv{k}">TV page</a> &middot; IPTV apps: <a href="/tv.m3u{k}">tv.m3u</a> + '
                  f'<a href="/guide.xml{k}">guide.xml</a>.')
     cfg = json.dumps({"lan": S.lan_base, "tvq": S.tv_quality, "key": S.access_key,
-                      "guide": 0 if tablo.lan_only else S.guide_refresh})
+                      "guide": 0 if tablo.lan_only else S.guide_refresh, "cc": S.captions})
     cast_tag = ('<script src="https://www.gstatic.com/cv/js/sender/v1/cast_sender.js?loadCastFramework=1"></script>'
                 if S.lan_base and LiveTV.available() and tablo.online else "")
     return fill(PAGE,
@@ -2051,7 +2196,7 @@ def make_handler(tablo: Tablo, favs: Favorites, port: int):
                 try:
                     job = live.touch(ident, viewer, q)
                 except Exception as e:
-                    log.error(f"[{ch.display_name}] could not tune for browser: {e}")
+                    log.error(f"[{ch.display_name}] could not tune for browser: {e}.{tablo.busy_hint()}")
                     return self.send_body(b"Tablo could not tune (all tuners busy?)", "text/plain", 503)
                 playlist = job.folder / "index.m3u8"
                 # Wait (up to ~25 s) for ffmpeg's first segment: answering with an empty
@@ -2167,9 +2312,10 @@ def make_handler(tablo: Tablo, favs: Favorites, port: int):
             if old:
                 tablo.end_session(old)
             try:
-                url, token = tablo.watch_session(ident)
+                url, token = tablo.watch_session(
+                    ident, who="VLC on this PC" if viewer in ("127.0.0.1", "::1") else f"VLC on {viewer}")
             except Exception as e:
-                log.error(f"[{ch.display_name}] could not tune: {e}")
+                log.error(f"[{ch.display_name}] could not tune: {e}.{tablo.busy_hint()}")
                 return self.send_error(503, "Tablo could not tune (all tuners busy?)")
             with sessions_lock:
                 sessions[viewer] = token
@@ -2671,9 +2817,110 @@ def show_info(tablo, ch) -> None:
     print()
 
 
+def when(a: dict) -> str:
+    """'NOW', '8:00 PM' (today) or 'Tue 8:00 PM' (another day) for an airing."""
+    start, end = a.get("_start"), a.get("_end")
+    t = datetime.now(timezone.utc)
+    if start and end and start <= t < end:
+        return "NOW"
+    if not start:
+        return ""
+    local = start.astimezone()
+    return a["start"] if local.date() == datetime.now().date() else f"{local:%a} {a['start']}"
+
+
+def search_guide(tablo, favs, query: str) -> list:
+    """Find shows matching `query` (title, episode, genre or type, any case).
+    What's on now is searched on every channel (one cloud request). Upcoming shows
+    are searched on your favorites, plus any channel whose schedule is already
+    loaded (fetching the full schedule of 100+ channels would take hundreds of
+    requests). Returns [(channel, airing)] sorted by start time."""
+    words = query.lower().split()
+    def match(a):
+        hay = " ".join((a["show"], a["episode"], a["genres"], a["kind"])).lower()
+        return all(w in hay for w in words)
+    found, seen = [], set()
+    for ident, a in tablo.now_playing().items():
+        ch = tablo.by_id(ident)
+        if ch and match(a):
+            found.append((ch, a))
+            seen.add((ident, a["_start"]))
+    cached = set(getattr(tablo, "_air_cache", {}) or {})
+    for ch in tablo.channels:
+        if ch.identifier not in cached and ch.identifier not in favs.ids:
+            continue
+        for a in tablo.upcoming(ch.identifier, count=50):
+            if match(a) and (ch.identifier, a["_start"]) not in seen:
+                found.append((ch, a))
+                seen.add((ch.identifier, a["_start"]))
+    far = datetime.max.replace(tzinfo=timezone.utc)
+    return sorted(found, key=lambda x: (x[1]["_start"] or far, x[0].major, x[0].minor))
+
+
+def print_search(tablo, favs, query: str, numbered: dict | None = None) -> None:
+    """Show guide search results with menu numbers you can type to watch."""
+    if tablo.lan_only:
+        print("No guide in --offline mode (it comes from the internet).")
+        return
+    hits = search_guide(tablo, favs, query)
+    number_of = {ch.identifier: n for n, ch in (numbered or menu_numbers(tablo, favs)).items()}
+    width = shutil.get_terminal_size((100, 24)).columns
+    if not hits:
+        print(f"\nNo shows matching '{query}' right now, or coming up on your favorites.")
+        return
+    print(f"\n{len(hits)} show{'s' if len(hits) != 1 else ''} matching '{query}':")
+    for ch, a in hits[:40]:
+        num = f"{ch.major}.{ch.minor}" if ch.major else ""
+        n = number_of.get(ch.identifier)
+        left = f"  ({time_left(a)})" if when(a) == "NOW" and time_left(a) else ""
+        line = f"  {when(a):>12}  {f'{n})' if n else '':>5} {num:<6} {short_name(ch)} · {airing_line(a)}{left}"
+        print(paint(clip(line, width), HEAD) if when(a) == "NOW" else clip(line, width))
+    if len(hits) > 40:
+        print(f"  ...and {len(hits) - 40} more. Try more words to narrow it down.")
+    print("Type a number or channel to watch. (Coming-up shows are searched on your favorites.)")
+
+
+def print_tuners(tablo, detail: bool = False) -> None:
+    """The menu's tuner line; with detail=True (menu 't'), one line per tuner in use."""
+    print(paint(tablo.tuner_summary() + ("" if detail else "   (t = details)"), DIM))
+    if not detail:
+        return
+    st = tablo.tuner_status()
+    head = f"\n{tablo.model}" if tablo.model else "\nYour Tablo"
+    print(head + (f": {st['total']} tuners" if st["total"] else " (tuner count not known yet)"))
+    for ch, who, since in sorted(st["ours"], key=lambda o: o[2]):
+        mins = int((time.time() - since) // 60)
+        num = f"{ch.major}.{ch.minor}" if ch.major else ""
+        print(f"  {num:<6} {short_name(ch):<12} {who:<22} {mins} min")
+    if not st["ours"]:
+        print("  None in use by this script.")
+    if st["busy"] is not None:
+        others = max(0, st["busy"] - len(st["ours"]))
+        print(f"  The Tablo reports {st['busy']} busy in all"
+              + (f": {others} recording or on other TVs." if others else "."))
+    else:
+        free = st["total"] - len(st["ours"]) if st["total"] else None
+        print((f"  {free} free, as far as this script can tell. " if free is not None else "  ")
+              + "Recordings and the Tablo app on other TVs don't show up here.")
+    if not S.use_ffmpeg:
+        print("  (Direct mode: a channel stays listed until you switch channels or quit.)")
+
+
+def print_recent(tablo) -> None:
+    """'Recent: 9.1 KNINE · 4.1 KFOUR ...   (p = previous channel)' under the menu."""
+    recent = tablo.recent()
+    if recent:
+        names = " · ".join(f"{c.major}.{c.minor} {short_name(c)}" if c.major else short_name(c) for c in recent)
+        print(paint(f"\nRecent: {names}   (p = previous channel)", DIM))
+
+
 def print_channels(tablo, favs, show_streaming=True, guide=True):
-    """Numbered list; returns {number: channel}."""
+    """Numbered list; returns {number: channel}.
+    With --max-channels N (or max_channels in tablo.ini) only the first N are
+    printed: favorites always, then local, then FAST. Channels past the limit keep
+    their numbers and can still be watched by number, channel (9.1) or name."""
     numbered, n = {}, 0
+    limit, printed, cut = S.max_channels, 0, 0
     now = tablo.now_playing() if guide else {}
     tablo.shown_now = now  # VLC titles reuse exactly what this list showed
     if tablo.lan_only:
@@ -2688,18 +2935,30 @@ def print_channels(tablo, favs, show_streaming=True, guide=True):
                 print("\nFavorites\n  (none - add e.g. 'favorites = 4.1, 9.1' to tablo.ini)")
             continue
         hidden = title.startswith("FAST") and not show_streaming
-        if hidden:
-            print(f"\n{title}: {len(chans)} channel{'s' if len(chans) != 1 else ''} (type 's' to show)")
-        else:
-            heading = f"★ {title}" if title == "Favorites" else title
-            print("\n" + paint(heading, FAV_HEAD if title == "Favorites" else HEAD))
         cells = []
         for ch in chans:
             n += 1
-            numbered[n] = ch
+            numbered[n] = ch                 # numbered even when not printed
             cells.append((n, ch))
-        if not hidden:
-            print_columns(cells, now, fav=title == "Favorites")
+        if not hidden and limit and title != "Favorites":   # favorites always show in full
+            room = max(0, limit - printed)
+            cut += len(cells) - min(room, len(cells))
+            cells = cells[:room]
+            if not cells:
+                print(f"\n{title}: {len(chans)} channel{'s' if len(chans) != 1 else ''} "
+                      f"(not shown: over the {limit}-channel limit)")
+                continue
+        if hidden:
+            print(f"\n{title}: {len(chans)} channel{'s' if len(chans) != 1 else ''} (type 's' to show)")
+            continue
+        heading = f"★ {title}" if title == "Favorites" else title
+        print("\n" + paint(heading, FAV_HEAD if title == "Favorites" else HEAD))
+        print_columns(cells, now, fav=title == "Favorites")
+        printed += len(cells)
+    if cut:
+        print(paint(f"\n  {cut} more channel{'s' if cut != 1 else ''} not shown (limit {limit}). "
+                    f"Type a channel like 9.1 or a name to watch any of them; "
+                    f"--max-channels 0 shows all.", DIM))
     if favs.missing:
         print(f"\n  Not found from tablo.ini favorites: {', '.join(favs.missing)}")
     return numbered
@@ -2752,12 +3011,18 @@ def menu(tablo, favs, port, web):
     base = f"http://127.0.0.1:{port}"
     show_streaming = not tablo.lan_only   # FAST can't play in --offline mode
     numbered = print_channels(tablo, favs, show_streaming)
-    help_line = ("\nType a number or channel (9.1, KFOR) to watch.  i3 = what's on / details\n"
-                 "+3 / -3 = add/remove favorite  "
-                 "f=favorites  a=all  s=show/hide FAST  l=list  r=refresh guide"
-                 + ("  w=web page" if web else "") + "  q=quit\n"
-                 "Keep this window open while watching.")
-    print(help_line)
+    help_line = ("\nType a number or channel (9.1, KFOR) to watch.  p = previous channel  i3 = details\n"
+                 "/football = search the guide  +3 / -3 = add/remove favorite  r = refresh guide  "
+                 "t = tuners\n"
+                 "f=favorites  a=all  s=show/hide FAST  l=list" + ("  w=web page" if web else "")
+                 + "  q=quit    Keep this window open while watching.")
+    watched_now = None                     # channel watched in this session (for 'p')
+
+    def show_menu():
+        print_recent(tablo)
+        print_tuners(tablo)
+        print(help_line)
+    show_menu()
     while True:
         try:
             choice = input("> ").strip()
@@ -2771,8 +3036,26 @@ def menu(tablo, favs, port, web):
             return
         if c in ("l", "list", "?", "h", "help"):
             numbered = print_channels(tablo, favs, show_streaming)
-            print(help_line)
+            show_menu()
             continue
+        if c.startswith("/") or c.startswith("find "):        # /football  or  find football
+            q = choice[1:].strip() if c.startswith("/") else choice[5:].strip()
+            if q:
+                print_search(tablo, favs, q, numbered)
+            else:
+                print("Type / and a word, e.g. /football or /news")
+            continue
+        if c in ("t", "tuners"):                                # who's using the Tablo's tuners
+            print_tuners(tablo, detail=True)
+            continue
+        if c in ("p", "prev", "previous", "last"):             # like a remote's Last button
+            recent = tablo.recent()
+            ch = (recent[1] if watched_now and len(recent) > 1 else recent[0] if recent and not watched_now else None)
+            if not ch:
+                print("No previous channel yet.")
+                continue
+            choice = str(ch.major) + "." + str(ch.minor) if ch.major else ch.call_sign
+            c = choice.lower()
         if c in ("r", "refresh"):
             if tablo.lan_only:
                 print("No guide in --offline mode (it comes from the internet).")
@@ -2780,13 +3063,13 @@ def menu(tablo, favs, port, web):
             print("Refreshing the guide...")
             tablo.refresh_guide()
             numbered = print_channels(tablo, favs, show_streaming)
-            print(help_line)
+            show_menu()
             print(f"Guide refreshed at {tablo.guide_time()}.")
             continue
         if c == "s":
             show_streaming = not show_streaming
             numbered = print_channels(tablo, favs, show_streaming)
-            print(help_line)
+            show_menu()
             continue
         if c == "f":
             launch_player(f"{base}/favorites.m3u", playlist=True) and print(f"Opening favorites in {player_name()}")
@@ -2805,7 +3088,7 @@ def menu(tablo, favs, port, web):
         if c[0] in "+-" and len(c) > 1:
             change_favs(tablo, favs, [choice[1:]], add=c[0] == "+", numbered=numbered)
             numbered = print_channels(tablo, favs, show_streaming)
-            print(help_line)
+            show_menu()
             continue
         ch = resolve(tablo, favs, choice, numbered)
         if not ch:
@@ -2820,6 +3103,8 @@ def menu(tablo, favs, port, web):
         shown = getattr(tablo, "shown_now", {}) or {}
         if launch_player(f"{base}/ch/{ch.identifier}", vlc_meta(ch, shown.get(ch.identifier))):
             print(f"Playing {ch.display_name} in {player_name()}")
+            tablo.remember_watched(ch.identifier)
+            watched_now = ch
 
 
 HELP_EPILOG = """\
@@ -2834,6 +3119,8 @@ examples:
   {RUN} --lan                   share with phones, tablets and TVs
   {RUN} --offline               home network only, no internet
   {RUN} --refresh-guide         refresh the guide in the copy that's already running
+  {RUN} --search football       find a show (in the menu: /football; p = previous channel)
+  {RUN} --max-channels          list only the first 50 channels (or --max-channels 30)
 
 computers that can run this script:
   Ubuntu / Pop!_OS / Linux   ./tablo-vlc.py      (VLC: apt, Snap or Flatpak)
@@ -3189,9 +3476,13 @@ def build_parser() -> argparse.ArgumentParser:
                     "With no options, shows a channel menu.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=HELP_EPILOG.replace("{RUN}", RUN))
+    ap.add_argument("--version", action="version", version=f"tablo-vlc {__version__}")
     ap.add_argument("--play", metavar="CH",
                     help="play a channel (9.1, KFOR, a menu number) or 'favorites' / 'all'")
     ap.add_argument("--list", action="store_true", help="print favorites and all channels, then exit")
+    ap.add_argument("--search", metavar="WORDS",
+                    help="search the TV guide, e.g. --search football (now on every channel; "
+                         "coming up on your favorites)")
     ap.add_argument("--info", metavar="CH", help="show what's on a channel now and next (e.g. --info 9.1)")
     ap.add_argument("--add-fav", nargs="+", metavar="CH",
                     help="add channels to favorites in tablo.ini (e.g. --add-fav 9.1 KFOR 702.1)")
@@ -3234,6 +3525,9 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--direct", action="store_true", help="never use ffmpeg; VLC plays the Tablo stream itself")
     ap.add_argument("--port", type=int, help="local port (default from tablo.ini or 8000)")
     ap.add_argument("--columns", type=int, metavar="N", help="channel list columns (default: fit the window)")
+    ap.add_argument("--max-channels", type=int, nargs="?", const=50, metavar="N",
+                    help="list at most N channels in the menu and --list (default 50 if N is left out; "
+                         "0 = all). Favorites always show; the rest can still be typed by number or name")
     ap.add_argument("--no-color", action="store_true", help="plain text channel list (no colors)")
     ap.add_argument("--debug", action="store_true", help="show detailed messages on screen too")
     ap.add_argument("--debug-raw", action="store_true",
@@ -3249,10 +3543,13 @@ def apply_display_options(args) -> None:
     if args.debug_raw:
         log.warning("--debug-raw: tokens are written to the log unredacted. Don't share this log.")
     S.columns = max(0, args.columns or 0)
+    if args.max_channels is not None:
+        S.max_channels = max(0, args.max_channels)    # tablo.ini max_channels is read later
     if args.no_color:
         S.use_color = False
     S.use_ffmpeg = bool(shutil.which("ffmpeg")) and not args.direct
-    log.debug(f"Started: {' '.join(sys.argv)}")
+    log.debug(f"Started tablo-vlc {__version__} on Python {sys.version.split()[0]} "
+              f"({sys.platform}): {' '.join(sys.argv)}")
 
 
 def load_login(args):
@@ -3330,6 +3627,12 @@ def apply_playback_settings(args, cfg, t) -> int:
         except ValueError:
             log.warning(f"{name} in {CONFIG_FILE.name} should be a number like 720 or 1080")
     S.encoder_setting = (args.encoder or t.get("encoder", "") or "auto").strip().lower()
+    S.captions = t.get("captions", "").strip().lower() in ("on", "yes", "true", "1")
+    if args.max_channels is None:              # --max-channels wins over tablo.ini
+        try:
+            S.max_channels = max(0, int(t.get("max_channels", "") or 0))
+        except ValueError:
+            log.warning(f"max_channels in {CONFIG_FILE.name} should be a number; showing all channels")
     try:                                       # minutes; 0 = no automatic refresh, else at least 2
         g = int(args.guide_refresh if args.guide_refresh is not None else (t.get("guide_refresh", "") or 10))
         S.guide_refresh = 0 if g <= 0 else max(2, g)
@@ -3358,6 +3661,9 @@ def run_one_shot(args, tablo, favs, port) -> bool:
         return True
     if args.list:
         print_channels(tablo, favs, show_streaming=True)
+        return True
+    if args.search:
+        print_search(tablo, favs, args.search)
         return True
     if args.info:
         ch = resolve(tablo, favs, args.info)
@@ -3427,6 +3733,7 @@ def serve(args, tablo, favs, port) -> None:
     announce(args, tablo, port)
     if args.lan and LiveTV.available():
         threading.Thread(target=choose_encoder, daemon=True).start()   # ready before the first phone/TV
+    threading.Thread(target=tablo.load_tuner_info, daemon=True).start()   # tuner count for the menu
     # what's on now every guide_refresh minutes; + /guide.xml for IPTV apps with --lan
     start_guide_refresher(tablo, favs, iptv=args.lan and LiveTV.available())
     if args.play:  # favorites / all playlist

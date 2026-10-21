@@ -53,6 +53,10 @@ QUICK START
   ./tablo-vlc.py            channel menu: type a number to watch
   ./tablo-vlc.py --lan      share with phones, tablets and TVs on your Wi-Fi
   ./tablo-vlc.py --help     everything else
+  ./tablo-vlc.py --version  which version you have
+
+  To start it automatically (systemd service, Docker, a Linux app-menu
+  entry), see extras/README.md.
 
 
 MADE FOR THE LINUX LAPTOP AND DESKTOP
@@ -92,10 +96,26 @@ WATCHING TV, THE TERMINAL WAY
     (--no-color turns colors off; the log file is always plain text.)
   * See what's on: current show, episode and time left for every channel.
     i3 shows the description and what's coming up next.
+  * Long channel list? --max-channels shows only the first 50 (or
+    --max-channels 30, or max_channels = 50 in tablo.ini). Favorites always
+    show, and you can still watch any hidden channel by typing its number
+    (9.1) or name.
   * The guide keeps itself current: it refreshes every 10 minutes on its
     own. Type r in the menu to refresh it right now.
   * Type a number and it plays in VLC. Pick another and it switches in the
     same VLC window, without piling up a playlist.
+  * p jumps back to the previous channel, like a remote's Last button. A
+    "Recent" line under the menu lists the last 5 channels you watched.
+  * Tuner status: the menu shows how many of your Tablo's tuners this
+    script is using, e.g. "Tuners: 2 of 4 in use by this script (9.1 KNINE,
+    4.1 KFOUR)". Type t for details: which channel, on which device, and
+    for how long. If a channel won't tune, the message says how many tuners
+    this script holds, so you know the rest are recording or on another TV.
+    (The Tablo doesn't tell other apps about its recordings, so those can't
+    be counted.)
+  * Search the guide: type /football (or --search football) to find shows
+    on now on every channel, and coming up on your favorites. Each result
+    has its number, so you can type it to watch.
   * One-liners: --play 2.1, --play favorites, --info 9.1, --add-fav 9.1 KFOR
   * VLC shows the channel and program name in its title bar, and the
     description in Media Information.
@@ -306,7 +326,7 @@ Once it worked on Linux, I kept going. The same single file now also covers:
 
     That runs only the server part: the phone/TV web pages, the TV playlist,
     the XMLTV guide and the ffmpeg conversion. It needs Python 3.10+ and
-    ffmpeg. Notes:
+    ffmpeg. A systemd service file and a Dockerfile are in extras/. Notes:
       * It must be able to reach the Tablo on your home network. Give a VM a
         bridged network adapter; run Docker with --network host (or publish
         port 8000), so phones and TVs can reach it.
@@ -331,7 +351,15 @@ Once it worked on Linux, I kept going. The same single file now also covers:
   startup and refreshed every 30 minutes, so apps never wait for it.
 
   TV page remote keys: arrows + OK pick a channel, CH+/CH- or up/down change
-  channel while watching, Back returns to the list.
+  channel while watching, left/right turn captions on/off, Back returns to
+  the list.
+
+  Closed captions: the broadcast's captions are kept when the video is
+  converted for phones and TVs. On a phone, use the player's CC button; on
+  the TV page, press left or right while watching. Set captions = on in
+  tablo.ini to start with them showing. In VLC, use the Subtitle menu.
+  (AMD's AMF graphics encoder on Windows can't carry captions; set
+  encoder = x264 if you need them there.)
 
 
 REQUIREMENTS
@@ -345,8 +373,9 @@ REQUIREMENTS
                 Windows: winget install Gyan.FFmpeg)
 
 
-FILES IT USES (all next to the script)
----------------------------------------
+FILES IT USES (all next to the script, or in the folder named by the
+TABLO_VLC_DIR environment variable if you set it)
+----------------------------------------------------------------------
   tablo.ini          your Tablo login, favorites, settings and optional
                      access key  (keep private)
   tablo-cache.json   saved channel list for offline use
@@ -355,9 +384,15 @@ FILES IT USES (all next to the script)
   tablo-hls.min.js   player library for phone/TV browsers (downloaded once)
 
   Also in the download (not needed to run it):
+  extras/            systemd service, Docker, Linux app-menu entry
+                     (see extras/README.md)
   tests/             automated tests with a fake Tablo:  python3 -m pytest
   .github/           runs those tests on Linux and Windows on every GitHub push
   .gitignore         keeps tablo.ini, the cache and logs out of GitHub
+  README.md          this file for GitHub's front page, with screenshots
+  docs/screenshots/  the pictures used in README.md
+  CHANGELOG.md       what changed in each version (see --version)
+  LICENSE            MIT license
 
   If you publish this on GitHub, add a .gitignore with:
       tablo.ini
@@ -380,9 +415,11 @@ Tested by me on a real Tablo 4th Gen:
   real Tablo broadcasts).
 
 Also tested in simulation (a mock Tablo, plus a real VLC where noted).
-42 of these checks ship as an automated test suite in tests/:
+53 of these checks ship as an automated test suite in tests/:
   Linux desktop
-  * Menu, columns, colors, favorites; --play, --info, --list, --tune
+  * Menu, columns, colors, favorites; --play, --info, --list, --tune,
+    --max-channels; p (previous channel), the Recent line, /search,
+    tuner status (t) and the "tuners busy" message
   * Request signing against the Tablo's local tuning endpoint
   * Same-window channel switching in a real VLC
   * Buffer (3 s default, adjustable) and deinterlacing options passed to VLC
@@ -398,9 +435,12 @@ Also tested in simulation (a mock Tablo, plus a real VLC where noted).
   * --restart-tablo with simulated Shelly (Gen1 and Gen2+), Tasmota and
     plain on/off-URL plugs: power off, back on by itself, waits for the
     Tablo; asks first; plug password kept out of the log
+  * Settings in another folder (TABLO_VLC_DIR), --version
   Bonus platforms
   * Windows code paths (checked on Linux)
   * Phone/TV conversion: 1080i MPEG-2 in, 720p/1080p H.264 + AAC out
+  * Closed captions: a broadcast-style stream with real CEA-608 captions
+    keeps them after the conversion; captions on/off on the TV page
   * Phone page and TV page (with remote keys) in phone- and TV-size browsers
   * TV playlist and a valid XMLTV guide, built in the background
   * Guide refresh: automatic, menu r, the web pages' Refresh guide button
@@ -425,9 +465,15 @@ Not tested on real hardware (built and simulation-tested only):
     Gen2+ plugs with a password set (digest login)
   * Running inside an actual container or VM (and the CPU-per-channel
     estimate above)
+  * The files in extras/: Docker image, systemd service and app-menu entry
   * Graphics-chip (hardware) encoding: the test machine had no GPU, so only
     the detection and the software fallback were tested
   * The system keyring on a real desktop (tested with a stand-in)
+  * Tuner status against a real Tablo: the tuner count, and whether the
+    4th Gen reports busy tuners (if it does, recordings get counted too)
+  * Closed captions shown on a real iPhone, Android phone or TV (the
+    captions are verified inside the converted video; whether Safari shows
+    them without extra playlist info is untested)
   * The GitHub Actions workflow (the same tests pass locally on Python
     3.11 and 3.13)
 
@@ -435,7 +481,7 @@ Not tested on real hardware (built and simulation-tested only):
 -------------------------------------------------------------------------------
 Shared as-is, with no support or warranty: this is what worked for me, not a
 maintained project. Tablo can change its service at any time, which may stop
-this from working.
+this from working. MIT licensed (see LICENSE).
 Unofficial; not affiliated with Tablo or Nuvyyo. Uses your own Tablo account.
 Builds on the open-source tablo-api and tablo2plex projects.
 Vibe coded with Claude (Anthropic) at 3am for about $10 in usage credits.
