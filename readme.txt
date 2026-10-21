@@ -87,13 +87,34 @@ WATCHING TV, THE TERMINAL WAY
 -----------------------------
   * A fast channel menu: favorites first (in color), local over-the-air
     channels, then free FAST channels, laid out in columns to fit your window.
+  * At startup, every web and IP address (this PC, the Tablo, the links for
+    phones, TVs and IPTV apps) is shown in light green so it's easy to spot.
+    (--no-color turns colors off; the log file is always plain text.)
   * See what's on: current show, episode and time left for every channel.
     i3 shows the description and what's coming up next.
+  * The guide keeps itself current: it refreshes every 10 minutes on its
+    own. Type r in the menu to refresh it right now.
   * Type a number and it plays in VLC. Pick another and it switches in the
     same VLC window, without piling up a playlist.
   * One-liners: --play 2.1, --play favorites, --info 9.1, --add-fav 9.1 KFOR
   * VLC shows the channel and program name in its title bar, and the
     description in Media Information.
+
+  Guide refresh, in short:
+    Automatic      every 10 minutes (set guide_refresh in tablo.ini, in
+                   minutes; 0 turns it off)
+    Menu           type r
+    Web pages      the "Refresh guide" button at the top of the page (top
+                   right on the phone/PC page). The phone page updates the
+                   list without stopping the video; the TV page refreshes
+                   when you're not watching. Both also update themselves.
+    Command line   ./tablo-vlc.py --refresh-guide  tells a copy that's
+                   already running (for example a headless --lan server) to
+                   refresh now. Each time the script starts, it loads the
+                   guide fresh anyway.
+  "Guide as of 5:02 PM" on the web pages shows when it was last updated.
+  The full two-day schedule used by IPTV apps (/guide.xml) is rebuilt every
+  30 minutes, or right after a manual refresh.
 
 
 TUNED FOR LIVE TV IN VLC
@@ -123,6 +144,66 @@ KEEPS WORKING WHEN THINGS GO WRONG
   * Cleans up leftover temp files if it was ever killed mid-stream.
   * Plain-English error messages instead of tracebacks (for example, a DNS
     filter blocking Tablo's servers).
+
+
+RESTART A STUCK TABLO (NEEDS A SMART PLUG YOU BUY SEPARATELY)
+--------------------------------------------------------------
+Every few months, and on big nights like the Super Bowl or the World Cup
+when everyone's watching, my Tablo gets stuck. The only fix is unplugging
+it. The Tablo has NO restart command: not in its app and not in its API.
+
+So --restart-tablo needs a PHYSICAL SMART PLUG. Plug the Tablo's power
+adapter into the smart plug, and the smart plug into the wall. The script
+then cuts the power for 30 seconds (Tablo's own advice), turns it back on,
+and waits until the Tablo is back online. Without a smart plug, this
+feature does nothing.
+
+  What to order (it must work over your home network, not only an app):
+    * Shelly Plug US Gen4  (or the older Shelly Plus Plug US)
+        sold by Shelly (shelly.com) and on Amazon
+    * Or a smart plug with Tasmota pre-installed, e.g. the Athom
+      PG03V3-US16A-TAS  (see templates.blakadder.com/preflashed)
+    Plugs that only work through the maker's phone app or cloud (most
+    store and big-brand plugs) won't work with the script.
+
+  Set it up once:
+    1. Set up the plug with its own app or web page and join it to your
+       Wi-Fi. Give it a fixed address in your router (e.g. 192.168.1.60).
+       Optional: set a password on the plug.
+    2. Plug ONLY the Tablo into it. Not your router, modem or this PC.
+    3. Add to tablo.ini:
+         smart_plug = shelly 192.168.1.60      (or: tasmota 192.168.1.61)
+         smart_plug_password = ...             (only if you set one)
+       Any other plug with on/off web addresses (Home Assistant, ESPHome):
+         smart_plug = url
+         smart_plug_off_url = http://...
+         smart_plug_on_url = http://...
+    4. Check it, without switching anything:   ./tablo-vlc.py --test-plug
+
+  Use it:
+    ./tablo-vlc.py --restart-tablo          asks first, then restarts
+    ./tablo-vlc.py --restart-tablo --yes    no question (for a schedule)
+
+  It doesn't need the Tablo cloud or a login, so it works when the internet
+  is down too. Shelly and Tasmota plugs are told to switch back on by
+  themselves after 30 seconds, so the Tablo comes back even if the PC loses
+  its connection mid-restart. If the Tablo keeps answering while the plug
+  is off, the script warns you that it's probably on a different outlet.
+
+  Restart on a schedule (optional): for example every Sunday at 4am, with
+  crontab -e on Linux:
+      0 4 * * 0  cd /path/to/tablo-vlc && ./tablo-vlc.py --restart-tablo --yes
+  (On Windows, use Task Scheduler with: py tablo-vlc.py --restart-tablo --yes)
+
+  Be careful:
+    * Never restart during a Tablo firmware update: Tablo says cutting power
+      then can corrupt its database. Updates usually happen overnight, so
+      check that your schedule doesn't overlap.
+    * A restart stops anything recording or being watched. The script can't
+      see your Tablo recordings, so pick a quiet time. Saved recordings and
+      settings are not affected.
+    * If the trouble is Tablo's cloud being overloaded (guide or login
+      failing for everyone), a restart won't help.
 
 
 PRIVACY AND SECURITY
@@ -299,7 +380,7 @@ Tested by me on a real Tablo 4th Gen:
   real Tablo broadcasts).
 
 Also tested in simulation (a mock Tablo, plus a real VLC where noted).
-28 of these checks ship as an automated test suite in tests/:
+42 of these checks ship as an automated test suite in tests/:
   Linux desktop
   * Menu, columns, colors, favorites; --play, --info, --list, --tune
   * Request signing against the Tablo's local tuning endpoint
@@ -314,11 +395,17 @@ Also tested in simulation (a mock Tablo, plus a real VLC where noted).
   * A slow tune on one device doesn't stall another device's video
   * Leftover temp folders cleaned up; folders still in use left alone
   * Password from the system keyring (password = keyring)
+  * --restart-tablo with simulated Shelly (Gen1 and Gen2+), Tasmota and
+    plain on/off-URL plugs: power off, back on by itself, waits for the
+    Tablo; asks first; plug password kept out of the log
   Bonus platforms
   * Windows code paths (checked on Linux)
   * Phone/TV conversion: 1080i MPEG-2 in, 720p/1080p H.264 + AAC out
   * Phone page and TV page (with remote keys) in phone- and TV-size browsers
   * TV playlist and a valid XMLTV guide, built in the background
+  * Guide refresh: automatic, menu r, the web pages' Refresh guide button
+    (list swapped in place, video not interrupted; TV-remote navigation to
+    the button) and --refresh-guide against a running copy
   * Encoder choice: auto picks a working graphics encoder, falls back to
     software when none works or the setting is wrong
   * Headless server mode (--lan --no-vlc, no terminal or player attached)
@@ -334,6 +421,8 @@ Not tested on real hardware (built and simulation-tested only):
   * IPTV apps (TiviMate, UHF, iPlayTV, Kodi) with the playlist and guide
   * Whether the Tablo honors the tuner-release call, and allows local tuning
     with no internet at all
+  * --restart-tablo with a real smart plug and Tablo, including Shelly
+    Gen2+ plugs with a password set (digest login)
   * Running inside an actual container or VM (and the CPU-per-channel
     estimate above)
   * Graphics-chip (hardware) encoding: the test machine had no GPU, so only

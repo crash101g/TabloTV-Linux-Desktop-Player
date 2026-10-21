@@ -37,6 +37,15 @@ Extras:
   --encoder NAME   phone/TV video encoder: auto (graphics chip if possible), x264, ...
   --port N         use a different local port (default 8000)
   --debug          show detailed messages on screen
+
+TV guide: refreshes by itself every 10 minutes (guide_refresh in tablo.ini).
+  r in the menu, or the Refresh guide button on the web pages, refreshes it now;
+  --refresh-guide does the same for a copy that's already running (e.g. headless).
+
+Restart a stuck Tablo (the Tablo has no restart command, so this needs a physical
+smart plug, e.g. a Shelly Plug US, between the Tablo and the wall; see readme.txt):
+  --test-plug      check the smart plug answers (switches nothing)
+  --restart-tablo  power-cycle the Tablo (add --yes to skip the question, for a schedule)
 """
 
 # =============================================================================
@@ -63,7 +72,8 @@ Extras:
 # 11. Terminal menu         channel list in columns, colors, details view
 # 12. main()                command-line options and startup, split into steps
 #                           (load_login, connect_tablo, serve...); the
-#                           password keyring helpers live here too
+#                           password keyring and smart-plug restart
+#                           (--restart-tablo) helpers live here too
 # Settings for this run live in one object, S (class Settings).
 # Tests: tests/ (python3 -m pytest), with a fake Tablo; no account needed.
 #
@@ -113,7 +123,8 @@ Extras:
 #  Web server       one short-lived thread per web request (ThreadingHTTPServer),
 #                   so many devices can be served at once.
 #  LiveTV reaper    stops converters nobody has watched for 45 s.
-#  Guide refresher  rebuilds /guide.xml every 30 min (--lan only).
+#  Guide refresher  re-reads what's on now every guide_refresh minutes (10), and
+#                   rebuilds /guide.xml every 30 min (--lan only).
 #  Log readers      one per ffmpeg, copying its error output into the log.
 #  Shared data is guarded by locks: Tablo.lock (cloud data), LiveTV.lock (the
 #  converters), _xmltv_lock (the guide). Rule: never do slow work (tuning,
@@ -124,6 +135,7 @@ Extras:
 # WHERE TO CHANGE COMMON THINGS
 # -----------------------------------------------------------------------------
 #  Default port 8000 ................ DEFAULT_PORT
+#  Guide refresh (10 min) ........... guide_refresh in tablo.ini / start_guide_refresher
 #  Default VLC buffer (3 s) ......... DEFAULT_VLC_BUFFER (or vlc_buffer in tablo.ini;
 #                                     10000 = 10 s if Wi-Fi hiccups cause stutters)
 #  A new tablo.ini setting .......... CONFIG_HEADER (document it), save_config
@@ -133,7 +145,9 @@ Extras:
 #  A new web address (URL) .......... Handler.do_GET in make_handler
 #  A new video player ............... resolve_player / launch_player
 #  A new GPU encoder ................ ENCODERS and AUTO_ORDER
+#  Another smart plug type .......... class SmartPlug (--restart-tablo)
 #  Menu colors ...................... LIGHT_BLUE, HEAD, WARN, DIM (SECTION 11)
+#  Green addresses on screen ........ ADDRESS (color) and ADDRESS_RE (what counts)
 #  Phone/TV picture quality ......... browser_quality / tv_quality in tablo.ini
 #  Web page look .................... PAGE and TV_PAGE (HTML/CSS/JS templates)
 #
@@ -262,6 +276,7 @@ class Settings:
         self.deinterlace = "yadif2x"     # VLC deinterlace mode; "off" = none
         self.browser_quality = 720       # phones/tablets picture height (browser_quality)
         self.tv_quality = 1080           # TVs / Cast / IPTV apps picture height (tv_quality)
+        self.guide_refresh = 10          # minutes between automatic guide refreshes; 0 = off
         self.encoder_setting = "auto"    # tablo.ini encoder: auto, x264, vaapi, nvenc, qsv, amf
         self.encoder = None              # encoder actually used (found on first use)
         self.lan_base = ""               # "http://<this PC's IP>:<port>" with --lan (for Cast)
@@ -297,12 +312,22 @@ CONFIG_HEADER = """\
 #   deinterlace      : VLC deinterlace mode for 1080i broadcasts: yadif2x (default), yadif, bob, off
 #   browser_quality  : max picture height when watching in a phone/tablet browser: 480, 720 (default), 1080
 #   tv_quality       : max picture height for TVs, Cast and IPTV apps: 720, 1080 (default)
+#   guide_refresh    : minutes between automatic "what's on" refreshes for the menu and
+#                      the web pages (default 10; 0 = off). Refresh by hand any time:
+#                      r in the menu, the Refresh guide button, or --refresh-guide
 #   encoder          : video encoder for phones/TVs: auto (default: uses your graphics
 #                      chip if it can), x264 (software), vaapi, nvenc, qsv, amf
 #   access_key       : (optional) with --lan, other devices must use this key, e.g.
 #                      http://<PC-IP>:8000/?key=YOURKEY  (blank = anyone on your Wi-Fi)
 #   player           : (optional) video player: vlc, flatpak (Flatpak VLC), ffplay, mpv,
 #                      or a full command. Blank = VLC (regular, Snap or Flatpak), else ffplay.
+#   smart_plug       : (optional) for --restart-tablo. The Tablo has no restart command,
+#                      so this needs a PHYSICAL smart plug the Tablo is plugged into:
+#                        shelly 192.168.1.60     Shelly Plug US Gen4 / Plus Plug US
+#                        tasmota 192.168.1.61    plug with Tasmota (e.g. Athom PG03V3-US16A-TAS)
+#                        url                     any plug with on/off web addresses: also set
+#                                                smart_plug_off_url and smart_plug_on_url
+#   smart_plug_password : (optional) the plug's own login password, if you set one
 #   hash_key / device_key : Tablo app signing keys (needed to tune channels).
 #                      Same for every Tablo owner. Filled in automatically from
 #                      the tablo-api project on GitHub; refresh with --fetch-keys.
@@ -365,6 +390,22 @@ class ScrubFilter(logging.Filter):
         return True
 
 
+# Web addresses and IP addresses on screen are shown in light green, so the ones to type on a
+# phone or TV stand out. Only on screen: tablo-vlc.log stays plain text.
+ADDRESS_RE = re.compile(r"https?://[^\s,;)\"'<>]+|\b(?:\d{1,3}\.){3}\d{1,3}(?::\d+)?\b")
+
+
+def color_addresses(text: str) -> str:
+    """Color every URL / IP address in a line light green (if colors are on)."""
+    return ADDRESS_RE.sub(lambda m: f"{ADDRESS}{m.group(0)}{RESET}", text) if S.use_color else text
+
+
+class ScreenFormatter(logging.Formatter):
+    """On-screen log lines: the plain message, with addresses in light green."""
+    def format(self, record: logging.LogRecord) -> str:
+        return color_addresses(super().format(record))
+
+
 def setup_logging(debug: bool = False, raw: bool = False) -> None:
     """Log to the screen (INFO, or DEBUG with --debug) and to tablo-vlc.log
     (always DEBUG, rotated at 1 MB, 3 old copies). raw=True skips token scrubbing."""
@@ -374,7 +415,7 @@ def setup_logging(debug: bool = False, raw: bool = False) -> None:
     fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)-7s %(message)s"))
     ch = S.console = logging.StreamHandler(sys.stdout)
     ch.setLevel(logging.DEBUG if debug else logging.INFO)
-    ch.setFormatter(logging.Formatter("%(message)s"))
+    ch.setFormatter(ScreenFormatter("%(message)s"))      # addresses in light green on screen
     log.addHandler(fh)
     log.addHandler(ch)
     if not raw:
@@ -401,7 +442,7 @@ def save_config(cfg: configparser.ConfigParser) -> None:
     t = cfg["tablo"]
     for key, default in (("email", ""), ("password", ""), ("favorites", ""),
                          ("port", str(DEFAULT_PORT)), ("player", ""), ("vlc_buffer", str(DEFAULT_VLC_BUFFER)),
-                         ("deinterlace", "yadif2x"), ("browser_quality", "720"), ("tv_quality", "1080"), ("encoder", "auto"), ("access_key", ""), ("hash_key", ""), ("device_key", "")):
+                         ("deinterlace", "yadif2x"), ("browser_quality", "720"), ("tv_quality", "1080"), ("encoder", "auto"), ("guide_refresh", "10"), ("access_key", ""), ("smart_plug", ""), ("hash_key", ""), ("device_key", "")):
         t.setdefault(key, default)
     fd = os.open(CONFIG_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -883,6 +924,24 @@ class Tablo:
             now = self._saved_now()
         self._now_cache = (time.time(), now)
         return now
+
+    def refresh_guide(self) -> dict:
+        """Manual refresh (menu 'r', web button, --refresh-guide): fetch what's on now
+        right away and forget the cached 2-day listings so they're re-read when next
+        needed. Repeated presses within 20 s reuse the fresh copy (it's a cloud call)."""
+        if time.time() - getattr(self, "_forced_at", 0) < 20:
+            return self.now_playing()
+        self._forced_at = time.time()
+        self._air_cache = {}
+        _xmltv_cache["at"] = 0                    # /guide.xml rebuilds on its next request
+        now = self.now_playing(max_age=0)
+        log.info(f"Guide refreshed ({len(now)} channels with show info)")
+        return now
+
+    def guide_time(self) -> str:
+        """When 'what's on' was last fetched, e.g. '5:02 PM' ('' if never)."""
+        cache = getattr(self, "_now_cache", None)
+        return clock(datetime.fromtimestamp(cache[0])) if cache else ""
 
     def _saved_now(self) -> dict:
         """Last saved guide info that is still on air."""
@@ -1509,16 +1568,23 @@ button{background:var(--acc);color:#fff;border:0;border-radius:8px;padding:10px 
 #player video{width:100%;max-height:62vh;background:#000;border-radius:8px;display:block}
 #player .ph{display:flex;align-items:center;gap:10px;padding:6px 0} #ptitle{flex:1;font-weight:600}
 #pstate{color:var(--mute);font-size:13px} #pclose{padding:6px 12px;font-size:14px}
+.asof{color:var(--mute);font-size:13px} button:disabled{opacity:.6}
+.top{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin:0 0 4px}
+.top h1{margin:0} .gbar{display:flex;align-items:center;gap:10px;margin-left:auto}
+#gref{padding:8px 14px;font-size:14px}
 .saved{color:var(--acc)} .warn{border:1px solid var(--acc);border-radius:8px;padding:8px 12px;margin:8px 0;color:var(--fg)} .small{font-size:13px;margin-top:8px}
 </style></head><body>
 <div id="player"><div class="ph"><span id="ptitle"></span><span id="pstate"></span>
 <google-cast-launcher id="castbtn" style="display:none;width:30px;height:30px;--connected-color:#e8590c;cursor:pointer"></google-cast-launcher>
 <button id="pclose" type="button">Close</button></div><video id="video" controls playsinline autoplay x-webkit-airplay="allow"></video></div>
-<h1>Tablo Channels</h1>
+<div class="top"><h1>Tablo Channels</h1>
+<div class="gbar"><span class="asof" id="asof">%%ASOF%%</span><button type="button" id="gref">↻ Refresh guide</button></div></div>
 <p>Click Play to watch. Hover over a show for its description. Favorites come from the <b>favorites</b> line in tablo.ini.</p>
+<div id="chans">
 <h2>Favorites</h2>%%MISSING%%%%FAV%%
 <h2>Local (OTA)</h2>%%OTA%%
 <h2>FAST (online)</h2>%%OTT%%
+</div>
 <div class="bar">
 <a href="#" class="play pconly" data-id="all">Open all (VLC)</a>
 <a href="#" class="play pconly" data-id="favorites">Open favorites (VLC)</a>
@@ -1560,6 +1626,10 @@ h2{font-size:20px;letter-spacing:.08em;text-transform:uppercase;color:#9aa3b2;ma
 .num{font-weight:700;font-size:26px;color:#87d7ff;margin-right:10px}
 .name{font-weight:600;font-size:24px} .show{color:#c5ccd8;font-size:19px;margin-top:6px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .left{color:#8b93a1;font-size:16px}
+.gbar{display:flex;align-items:center;gap:18px;margin:0 0 6px}
+.gref{all:unset;box-sizing:border-box;background:#1b1f27;border-radius:12px;padding:10px 18px;font-size:19px;
+  border:3px solid transparent;cursor:pointer} .gref:focus,.gref:hover{border-color:#87d7ff;background:#243041;outline:none}
+.asof{color:#8b93a1;font-size:17px}
 .warn{background:#3a2f12;color:#ffe08a;border-radius:10px;padding:12px 16px;margin:10px 0;font-size:19px}
 #ov{display:none;position:fixed;inset:0;background:#000;z-index:10}
 #ov video{width:100%;height:100%;background:#000}
@@ -1569,6 +1639,7 @@ h2{font-size:20px;letter-spacing:.08em;text-transform:uppercase;color:#9aa3b2;ma
 #istate{font-size:20px;color:#87d7ff;margin-top:6px} .keys{font-size:16px;color:#9aa3b2;margin-top:10px}
 </style></head><body>
 <h1>Tablo TV</h1><p class="sub">Use the arrow keys and OK to pick a channel. While watching: ▲▼ or CH+/− change channel, OK shows info, Back returns here.</p>
+<div class="gbar"><button id="gref" class="gref">↻ Refresh guide</button><span class="asof">%%ASOF%%</span></div>
 %%NOTICE%%
 %%SECTIONS%%
 <div id="ov"><video id="v" playsinline autoplay x-webkit-airplay="allow"></video>
@@ -1577,6 +1648,8 @@ h2{font-size:20px;letter-spacing:.08em;text-transform:uppercase;color:#9aa3b2;ma
 <script src="/hls.min.js"></script>
 <script>
 const TVQ = %%TVQ%%, KEY = %%KEY%%;   // KEY: access key, if one is set in tablo.ini
+const GUIDE_MIN = %%GUIDE%%;          // tablo.ini guide_refresh (minutes; 0 = off)
+const gref = document.getElementById("gref");
 const tiles = [...document.querySelectorAll(".tile")];
 const ov = document.getElementById("ov"), v = document.getElementById("v"), info = document.getElementById("info");
 const ititle = document.getElementById("ititle"), ishow = document.getElementById("ishow"), istate = document.getElementById("istate");
@@ -1608,11 +1681,12 @@ tiles.forEach((t, i) => t.addEventListener("click", () => play(i)));
 
 // Arrow-key navigation between tiles (remote controls)
 function move(dx, dy) {
-  const a = document.activeElement, ar = (a && a.classList.contains("tile")) ? a.getBoundingClientRect() : null;
+  const nav = [gref, ...tiles];           // the Refresh guide button is reachable with ▲ too
+  const a = document.activeElement, ar = nav.includes(a) ? a.getBoundingClientRect() : null;
   if (!ar) { tiles[0] && tiles[0].focus(); return; }
   const ax = ar.left + ar.width / 2, ay = ar.top + ar.height / 2;
   let best = null, bestScore = 1e9;
-  for (const t of tiles) {
+  for (const t of nav) {
     if (t === a) continue;
     const r = t.getBoundingClientRect(), x = r.left + r.width / 2, y = r.top + r.height / 2;
     const ddx = x - ax, ddy = y - ay;
@@ -1638,7 +1712,14 @@ document.addEventListener("keydown", e => {
   if (dirs[k]) { e.preventDefault(); move(...dirs[k]); }
 });
 if (tiles.length) tiles[0].focus();
-setInterval(() => { if (ov.style.display !== "block") location.reload(); }, 10 * 60 * 1000);  // refresh what's on
+// Guide refresh: OK on the button asks the server to fetch what's on now, then reloads
+// the list. The list also reloads every GUIDE_MIN minutes, but never while watching.
+gref.addEventListener("click", async () => {
+  gref.textContent = "Refreshing…";
+  try { await fetch("/refresh-guide" + (KEY ? "?key=" + encodeURIComponent(KEY) : ""), {method: "POST"}); } catch (e) {}
+  location.reload();
+});
+if (GUIDE_MIN > 0) setInterval(() => { if (ov.style.display !== "block") location.reload(); }, GUIDE_MIN * 60 * 1000);
 </script></body></html>"""
 
 
@@ -1666,7 +1747,9 @@ def render_tv_page(tablo, favs) -> bytes:
     elif tablo.lan_only or not tablo.online:
         notice = '<div class="warn">No internet: local channels only.</div>'
     return fill(TV_PAGE, SECTIONS="".join(sections), NOTICE=notice,
-                TVQ=str(S.tv_quality), KEY=json.dumps(S.access_key)).encode()
+                TVQ=str(S.tv_quality), KEY=json.dumps(S.access_key),
+                GUIDE=str(0 if tablo.lan_only else S.guide_refresh),
+                ASOF=f"Guide as of {tablo.guide_time()}" if tablo.guide_time() else "").encode()
 
 
 PAGE_SCRIPT = r"""
@@ -1737,7 +1820,7 @@ video.addEventListener("playing", () => pstate.textContent = "");
 video.addEventListener("waiting", () => pstate.textContent = "Buffering…");
 document.getElementById("pclose").onclick = () => { stopVideo(); player.style.display = "none"; };
 
-document.querySelectorAll("a.play").forEach(a => a.addEventListener("click", async e => {
+function bindPlay(root) { root.querySelectorAll("a.play").forEach(a => a.addEventListener("click", async e => {
   e.preventDefault();
   const id = a.dataset.id, label = a.dataset.label || "";
   if (!IS_PC && id !== "all" && id !== "favorites") return watchHere(id, label);
@@ -1752,7 +1835,32 @@ document.querySelectorAll("a.play").forEach(a => a.addEventListener("click", asy
     }
     msg.textContent = "Error: " + text;
   } catch (err) { msg.textContent = "Error: " + err; }
-}));
+})); }
+bindPlay(document);
+
+// ---- Guide refresh: the button asks the server to fetch what's on now; then (and
+// every guide_refresh minutes on its own) the channel list is swapped in place, so
+// a video that's playing keeps playing.
+const chans = document.getElementById("chans"), gref = document.getElementById("gref");
+const asof = document.getElementById("asof");
+async function refreshGuide(force) {
+  try {
+    if (force) {
+      gref.disabled = true; gref.textContent = "Refreshing…";
+      const r = await fetch("/refresh-guide" + location.search, {method: "POST"});
+      if (!r.ok) throw new Error(await r.text());
+    }
+    const page = await (await fetch(location.pathname + location.search, {cache: "no-store"})).text();
+    const doc = new DOMParser().parseFromString(page, "text/html");
+    const fresh = doc.getElementById("chans");
+    if (!fresh) return;
+    chans.innerHTML = fresh.innerHTML; bindPlay(chans);
+    asof.textContent = doc.getElementById("asof").textContent;
+  } catch (err) { if (force) msg.textContent = "Couldn't refresh the guide: " + err.message; }
+  finally { gref.disabled = false; gref.textContent = "↻ Refresh guide"; }
+}
+gref.onclick = () => refreshGuide(true);
+if (TABLO.guide > 0) setInterval(() => refreshGuide(false), TABLO.guide * 60000);
 // ?play=<id> link (e.g. a bookmark) starts that channel
 const want = new URLSearchParams(location.search).get("play");
 if (want) { const a = document.querySelector('a.play[data-id="' + CSS.escape(want) + '"]'); if (a) watchHere(want, a.dataset.label); }
@@ -1804,11 +1912,13 @@ def render_page(tablo: Tablo, favs: Favorites) -> bytes:
         k = html.escape(kq())          # so copied links work in IPTV apps too
         note += (f' TVs: <a href="/tv{k}">TV page</a> &middot; IPTV apps: <a href="/tv.m3u{k}">tv.m3u</a> + '
                  f'<a href="/guide.xml{k}">guide.xml</a>.')
-    cfg = json.dumps({"lan": S.lan_base, "tvq": S.tv_quality, "key": S.access_key})
+    cfg = json.dumps({"lan": S.lan_base, "tvq": S.tv_quality, "key": S.access_key,
+                      "guide": 0 if tablo.lan_only else S.guide_refresh})
     cast_tag = ('<script src="https://www.gstatic.com/cv/js/sender/v1/cast_sender.js?loadCastFramework=1"></script>'
                 if S.lan_base and LiveTV.available() and tablo.online else "")
     return fill(PAGE,
         SCRIPT=PAGE_SCRIPT, PLAYER_NOTE=note, TABLO_CFG=cfg, CAST_TAG=cast_tag,
+        ASOF=f"Guide as of {tablo.guide_time()}" if tablo.guide_time() else "",
         MISSING=missing,
         FAV=section(favs.channels(), "None set. Add e.g. <code>favorites = 4.1, 9.1</code> to tablo.ini."),
         OTA=section(favs.others(tablo.ota), "None found."),
@@ -2012,9 +2122,14 @@ def make_handler(tablo: Tablo, favs: Favorites, port: int):
             self.wfile.write(body)
 
         def do_POST(self):
-            """POST /play/<id>: open a channel in the player on this PC (from the web page)."""
+            """POST /play/<id>: open a channel in the player on this PC (from the web page).
+            POST /refresh-guide: fetch what's on now again (web button, --refresh-guide)."""
             if not self.authorized():
                 return self.deny()
+            if self.path.split("?")[0] == "/refresh-guide":    # Refresh guide button / --refresh-guide
+                now = tablo.refresh_guide()
+                return self.send_body(json.dumps({"updated": tablo.guide_time(), "channels": len(now)}).encode(),
+                                      "application/json")
             if self.path.startswith("/play/"):
                 return self.play(urllib.parse.unquote(self.path.split("?")[0][6:]))
             self.send_error(404)
@@ -2471,6 +2586,7 @@ HEAD = "\033[1m"           # section headings: bold
 FAV_HEAD = LIGHT_BLUE       # "★ Favorites" heading
 WARN = "\033[1;33m"        # OFFLINE notice: bold yellow
 DIM = "\033[2m"
+ADDRESS = "\033[1;38;5;120m"  # web/IP addresses in startup messages: bold light green
 RESET = "\033[0m"
 
 
@@ -2638,7 +2754,8 @@ def menu(tablo, favs, port, web):
     numbered = print_channels(tablo, favs, show_streaming)
     help_line = ("\nType a number or channel (9.1, KFOR) to watch.  i3 = what's on / details\n"
                  "+3 / -3 = add/remove favorite  "
-                 "f=favorites  a=all  s=show/hide FAST  l=list" + ("  w=web page" if web else "") + "  q=quit\n"
+                 "f=favorites  a=all  s=show/hide FAST  l=list  r=refresh guide"
+                 + ("  w=web page" if web else "") + "  q=quit\n"
                  "Keep this window open while watching.")
     print(help_line)
     while True:
@@ -2655,6 +2772,16 @@ def menu(tablo, favs, port, web):
         if c in ("l", "list", "?", "h", "help"):
             numbered = print_channels(tablo, favs, show_streaming)
             print(help_line)
+            continue
+        if c in ("r", "refresh"):
+            if tablo.lan_only:
+                print("No guide in --offline mode (it comes from the internet).")
+                continue
+            print("Refreshing the guide...")
+            tablo.refresh_guide()
+            numbered = print_channels(tablo, favs, show_streaming)
+            print(help_line)
+            print(f"Guide refreshed at {tablo.guide_time()}.")
             continue
         if c == "s":
             show_streaming = not show_streaming
@@ -2706,6 +2833,7 @@ examples:
   {RUN} --web                   channel page in your browser
   {RUN} --lan                   share with phones, tablets and TVs
   {RUN} --offline               home network only, no internet
+  {RUN} --refresh-guide         refresh the guide in the copy that's already running
 
 computers that can run this script:
   Ubuntu / Pop!_OS / Linux   ./tablo-vlc.py      (VLC: apt, Snap or Flatpak)
@@ -2727,6 +2855,15 @@ other devices (start the script with --lan; the PC needs ffmpeg for these):
   TV page remote keys: arrows + OK pick, CH+/CH- or up/down change channel, Back returns.
   Quality: browser_quality (phones, 720) and tv_quality (TVs, 1080) in tablo.ini.
   Windows: allow Python through the firewall on Private networks when asked.
+
+restarting a stuck Tablo (every few months, or on big-game nights):
+  The Tablo has no restart command, so this needs a PHYSICAL smart plug between the
+  Tablo's power adapter and the wall, one this PC can switch on your network:
+  Shelly Plug US Gen4 (or Plus Plug US), or a Tasmota plug (e.g. Athom PG03V3-US16A-TAS).
+  In tablo.ini:  smart_plug = shelly 192.168.1.60   (or: tasmota 192.168.1.61)
+  {RUN} --test-plug          check the plug answers (switches nothing)
+  {RUN} --restart-tablo      power off 30 s, back on, wait until the Tablo answers
+  {RUN} --restart-tablo --yes   no question asked (for a scheduled restart)
 """
 
 
@@ -2736,8 +2873,196 @@ other devices (start the script with --lan; the PC needs ffmpeg for these):
 #   build_parser -> apply_display_options -> load_login -> connect_tablo ->
 #   apply_playback_settings -> run_one_shot (--list, --play...) -> announce ->
 #   serve (web server + menu). The keyring and guide-refresher helpers they
-#   use come first.
+#   use come first. --restart-tablo and --test-plug skip the login entirely
+#   (handled in load_login), so they work even when Tablo's cloud is down.
 # =============================================================================
+
+# --- Restarting the Tablo with a smart plug (--restart-tablo) ----------------
+# The Tablo has NO remote-restart command: not in its app, not in its API. When it
+# hangs (every few months, or on big-game nights), the only cure is cutting its
+# power. So this needs a PHYSICAL SMART PLUG between the Tablo's power adapter and
+# the wall, one that this PC can switch over your home network (no cloud):
+#   * Shelly Plug US Gen4 (or Shelly Plus Plug US): smart_plug = shelly 192.168.1.60
+#   * a plug with Tasmota pre-installed (e.g. Athom PG03V3-US16A-TAS):
+#                                                   smart_plug = tasmota 192.168.1.61
+#   * anything else with on/off web addresses (Home Assistant, ESPHome...):
+#       smart_plug = url, smart_plug_off_url = ..., smart_plug_on_url = ...
+# Shelly and Tasmota are told "off, then back on by yourself in 30 s", so the
+# Tablo comes back even if this PC loses its connection mid-restart.
+PLUG_OFF_SECONDS = 30          # Tablo's own advice: unplug, wait 30 seconds, plug back in
+PLUG_WAIT_SECONDS = 300        # then wait up to 5 minutes for it to start up
+PLUG_POLL_SECONDS = 5          # checking every 5 seconds
+
+
+class PlugError(RuntimeError):
+    """The smart plug isn't set up, can't be reached, or refused the command."""
+
+
+def _plug_get(url: str, password: str = "", timeout: int = 8) -> bytes:
+    """GET a plug's local web address. Shelly uses user 'admin' with basic (Gen1)
+    or digest (Gen2+) login; Tasmota's password goes in the URL instead."""
+    handlers = []
+    if password:
+        pw = urllib.request.HTTPPasswordMgrWithDefaultRealm()
+        pw.add_password(None, url, "admin", password)
+        handlers = [urllib.request.HTTPBasicAuthHandler(pw), urllib.request.HTTPDigestAuthHandler(pw)]
+    opener = urllib.request.build_opener(*handlers)
+    try:
+        with opener.open(url, timeout=timeout) as r:
+            return r.read()
+    except urllib.error.HTTPError as e:
+        raise PlugError(f"the plug answered {e.code}"
+                        + (" (wrong or missing smart_plug_password?)" if e.code == 401 else "")) from None
+    except (urllib.error.URLError, OSError) as e:
+        raise PlugError(f"can't reach the plug at {url.split('/')[2]} "
+                        f"({getattr(e, 'reason', e)})") from None
+
+
+class SmartPlug:
+    """The smart plug the Tablo is plugged into (tablo.ini smart_plug)."""
+    def __init__(self, t):
+        setting = t.get("smart_plug", "").strip()
+        if not setting:
+            raise PlugError("no smart plug is set up. Add one to tablo.ini, e.g.\n"
+                            "  smart_plug = shelly 192.168.1.60\n(see 'Restart the Tablo' in readme.txt)")
+        kind, _, host = setting.partition(" ")
+        self.kind, self.host = kind.lower(), host.strip().replace("http://", "").rstrip("/")
+        self.password = t.get("smart_plug_password", "").strip()
+        register_secret(self.password)
+        self.off_url = t.get("smart_plug_off_url", "").strip()
+        self.on_url = t.get("smart_plug_on_url", "").strip()
+        if self.kind not in ("shelly", "tasmota", "url"):
+            raise PlugError(f"smart_plug = {setting!r}: start it with shelly, tasmota or url")
+        if self.kind == "url" and not (self.off_url and self.on_url):
+            raise PlugError("smart_plug = url needs smart_plug_off_url and smart_plug_on_url too")
+        if self.kind != "url" and not self.host:
+            raise PlugError(f"smart_plug = {setting!r}: add the plug's IP address after '{self.kind}'")
+        self.gen = 0                                    # Shelly generation, found on first use
+
+    def _tasmota(self, command: str) -> dict:
+        q = {"cmnd": command}
+        if self.password:
+            q.update(user="admin", password=self.password)
+        return json.loads(_plug_get(f"http://{self.host}/cm?" + urllib.parse.urlencode(q)) or b"{}")
+
+    def _shelly_gen(self) -> int:
+        if not self.gen:
+            info = json.loads(_plug_get(f"http://{self.host}/shelly") or b"{}")   # needs no login
+            self.gen = int(info.get("gen") or 1)
+        return self.gen
+
+    def is_on(self):
+        """True/False, or None when the plug type can't report it (url plugs)."""
+        if self.kind == "tasmota":
+            return str(self._tasmota("Power").get("POWER", "")).upper() == "ON"
+        if self.kind == "shelly":
+            if self._shelly_gen() >= 2:
+                st = json.loads(_plug_get(f"http://{self.host}/rpc/Switch.GetStatus?id=0", self.password))
+                return bool(st.get("output"))
+            return bool(json.loads(_plug_get(f"http://{self.host}/relay/0", self.password)).get("ison"))
+        return None
+
+    def describe(self) -> str:
+        if self.kind == "shelly":
+            return f"Shelly (Gen{self._shelly_gen()}) at {self.host}"
+        return f"Tasmota plug at {self.host}" if self.kind == "tasmota" else "plug (custom web addresses)"
+
+    def power_cycle(self, seconds: int = 0) -> None:
+        """Turn the Tablo off, and back on after `seconds` (default PLUG_OFF_SECONDS).
+        Shelly and Tasmota switch back on by themselves; url plugs are switched on by us."""
+        seconds = seconds or PLUG_OFF_SECONDS
+        if self.kind == "tasmota":   # Delay counts tenths of a second
+            self._tasmota(f"Backlog Power Off; Delay {int(seconds * 10)}; Power On")
+        elif self.kind == "shelly" and self._shelly_gen() >= 2:
+            _plug_get(f"http://{self.host}/rpc/Switch.Set?id=0&on=false&toggle_after={seconds}", self.password)
+        elif self.kind == "shelly":
+            _plug_get(f"http://{self.host}/relay/0?turn=off&timer={seconds}", self.password)
+        else:
+            _plug_get(self.off_url, self.password)
+            time.sleep(seconds)
+            _plug_get(self.on_url, self.password)
+
+
+def tablo_answers(device_url: str) -> bool:
+    """Is the Tablo's own web service up? Any reply at all (even an error page) counts."""
+    try:
+        with urllib.request.urlopen(device_url + "/", timeout=3):
+            return True
+    except urllib.error.HTTPError:
+        return True
+    except Exception:
+        return False
+
+
+def saved_tablo_url(args) -> str:
+    """The Tablo's address: --tablo-ip, else the one saved by the last connection."""
+    if args.tablo_ip:
+        addr = args.tablo_ip.strip().rstrip("/")
+        return addr if addr.startswith("http") else "http://" + (addr if ":" in addr else addr + ":8885")
+    return load_cache().get("device_url", "")
+
+
+def cmd_test_plug(t) -> None:
+    """--test-plug: check the smart plug answers, without switching anything."""
+    try:
+        plug = SmartPlug(t)
+        state = plug.is_on()
+        print(f"Smart plug OK: {plug.describe()}"
+              + ("" if state is None else f", power is {'ON' if state else 'OFF'}"))
+    except PlugError as e:
+        sys.exit(f"Smart plug problem: {e}")
+
+
+def cmd_restart_tablo(args, t) -> None:
+    """--restart-tablo: power-cycle the Tablo through its smart plug, then wait for it.
+    Asks first unless --yes (for a scheduled restart, e.g. cron at 4am)."""
+    try:
+        plug = SmartPlug(t)
+        state = plug.is_on()
+    except PlugError as e:
+        sys.exit(f"Can't restart the Tablo: {e}")
+    url = saved_tablo_url(args)
+    print(f"Smart plug: {plug.describe()}" + (f"   Tablo: {url}" if url else ""))
+    if not args.yes:
+        print(f"This cuts the Tablo's power for {PLUG_OFF_SECONDS} seconds. Anything recording or being\n"
+              f"watched right now will stop. Never do this during a Tablo firmware update.")
+        if input("Restart the Tablo now? [y/N]: ").strip().lower() not in ("y", "yes"):
+            print("Cancelled.")
+            return
+    if state is False:
+        log.info("The plug was already OFF; turning it on.")
+        if plug.kind == "tasmota":
+            plug._tasmota("Power On")
+        elif plug.kind == "shelly":
+            _plug_get(f"http://{plug.host}/rpc/Switch.Set?id=0&on=true" if plug._shelly_gen() >= 2
+                      else f"http://{plug.host}/relay/0?turn=on", plug.password)
+    else:
+        log.info(f"Restarting the Tablo: power off for {PLUG_OFF_SECONDS} s...")
+        started = time.time()
+        try:
+            plug.power_cycle()
+        except PlugError as e:
+            sys.exit(f"The plug didn't take the command: {e}")
+        if url:
+            time.sleep(PLUG_OFF_SECONDS / 3)   # 10 s into the 30 s off-time
+            if tablo_answers(url):          # still up with its power off? wrong outlet?
+                log.warning("The Tablo still answers with the plug off. Is the Tablo's power adapter "
+                            "really plugged into this smart plug?")
+        time.sleep(max(0, PLUG_OFF_SECONDS - (time.time() - started)))
+        log.info("Power is back on.")
+    if not url:
+        print("The Tablo usually takes 1-3 minutes to start up (its light goes solid).")
+        return
+    log.info("Waiting for the Tablo to start (usually 1-3 minutes)...")
+    deadline = time.time() + PLUG_WAIT_SECONDS
+    while time.time() < deadline:
+        if tablo_answers(url):
+            log.info(f"The Tablo is back online at {url}.")
+            return
+        time.sleep(PLUG_POLL_SECONDS)
+    log.warning("The Tablo hasn't answered after 5 minutes. Check its light and network cable "
+                "(it may also have a new address: try --tablo-ip).")
+
 
 # --- Optional system keyring for the password --------------------------------
 # 'password = keyring' in tablo.ini means: the real password is in your desktop's
@@ -2808,20 +3133,53 @@ def get_password(t) -> str:
     return pw
 
 
-def start_guide_refresher(tablo, favs) -> None:
-    """Build /guide.xml now in the background and rebuild it every 30 minutes,
-    so IPTV apps (TiviMate, IPTV Smarters...) never wait on dozens of cloud calls."""
+def start_guide_refresher(tablo, favs, iptv: bool = True) -> None:
+    """Keep the guide fresh in the background:
+      * every guide_refresh minutes (tablo.ini, default 10): what's on now, for the
+        menu and the web pages (they pick it up on their next redraw/refresh)
+      * with iptv=True (--lan + ffmpeg): build /guide.xml now and rebuild it every
+        30 minutes, so IPTV apps (TiviMate...) never wait on dozens of cloud calls."""
+    if not iptv and (not S.guide_refresh or tablo.lan_only):
+        return                                       # nothing to do
+
     def loop():
+        next_full = 0.0
         while True:
             try:
-                first = not _xmltv_cache["xml"]
-                build_xmltv(tablo, favs)
-                if first:
-                    log.info("TV guide ready for IPTV apps (/guide.xml)")
+                if iptv and time.time() >= next_full:
+                    first = not _xmltv_cache["xml"]
+                    build_xmltv(tablo, favs)
+                    next_full = time.time() + GUIDE_REFRESH
+                    if first:
+                        log.info("TV guide ready for IPTV apps (/guide.xml)")
             except Exception as e:                   # offline / cloud down: keep the old copy
                 log.debug(f"Guide refresh skipped: {e}")
-            time.sleep(GUIDE_REFRESH)
+            step = S.guide_refresh * 60 if S.guide_refresh else GUIDE_REFRESH
+            time.sleep(min(step, max(5, next_full - time.time())) if iptv else step)
+            if S.guide_refresh and not tablo.lan_only:
+                try:
+                    tablo.now_playing(max_age=0)         # what's on now
+                    log.debug(f"Guide auto-refresh at {tablo.guide_time()}")
+                except Exception as e:
+                    log.debug(f"Guide auto-refresh skipped: {e}")
     threading.Thread(target=loop, name="guide-refresher", daemon=True).start()
+
+
+def cmd_refresh_guide(args, t) -> None:
+    """--refresh-guide: ask the copy of this script that's already running (menu,
+    --web or --lan) to refresh its guide now. It's always fresh when it starts."""
+    port = args.port or int(t.get("port", "") or DEFAULT_PORT)
+    req = urllib.request.Request(f"http://127.0.0.1:{port}/refresh-guide", data=b"", method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            info = json.loads(r.read() or b"{}")
+        print(f"Guide refreshed at {info.get('updated', '?')} "
+              f"({info.get('channels', 0)} channels with show info).")
+    except urllib.error.HTTPError as e:
+        sys.exit(f"The running script refused: {e.code} {e.reason}")
+    except (urllib.error.URLError, OSError):
+        sys.exit(f"tablo-vlc isn't running on port {port}, so there's nothing to refresh.\n"
+                 f"(Each time it starts, it loads the guide fresh.)")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -2843,6 +3201,16 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--lan", action="store_true",
                     help="let phones, tablets and TVs on your Wi-Fi watch (see 'other devices' below)")
     ap.add_argument("--setup", action="store_true", help="enter your Tablo email and password")
+    ap.add_argument("--refresh-guide", action="store_true",
+                    help="refresh the TV guide now in the copy of this script that's already running")
+    ap.add_argument("--guide-refresh", type=int, metavar="MIN",
+                    help="minutes between automatic guide refreshes for this run (0 = off; default 10)")
+    ap.add_argument("--restart-tablo", action="store_true",
+                    help="restart a stuck Tablo by switching its power off and on. Needs a smart plug "
+                         "(Shelly or Tasmota) on the Tablo, set in tablo.ini: smart_plug = shelly 192.168.1.60")
+    ap.add_argument("--test-plug", action="store_true",
+                    help="check the smart plug answers, without switching it")
+    ap.add_argument("--yes", action="store_true", help="don't ask before --restart-tablo (for scheduled restarts)")
     ap.add_argument("--fetch-keys", action="store_true",
                     help="download the Tablo signing keys from GitHub into tablo.ini (done automatically if missing)")
     ap.add_argument("--favorites", action="store_true", help=argparse.SUPPRESS)  # old alias
@@ -2892,6 +3260,12 @@ def load_login(args):
     Returns (cfg, section), or None when a command like --setup has finished."""
     cfg = load_config()
     t = cfg["tablo"]
+    if args.refresh_guide:                     # just talks to the running copy
+        cmd_refresh_guide(args, t)
+        return None
+    if args.test_plug or args.restart_tablo:   # no login needed: just the plug and the Tablo
+        cmd_test_plug(t) if args.test_plug else cmd_restart_tablo(args, t)
+        return None
     if args.setup:
         cmd_setup(cfg)
         print("Add your favorites to tablo.ini (e.g. favorites = 4.1, 9.1), then run with no options.")
@@ -2956,6 +3330,11 @@ def apply_playback_settings(args, cfg, t) -> int:
         except ValueError:
             log.warning(f"{name} in {CONFIG_FILE.name} should be a number like 720 or 1080")
     S.encoder_setting = (args.encoder or t.get("encoder", "") or "auto").strip().lower()
+    try:                                       # minutes; 0 = no automatic refresh, else at least 2
+        g = int(args.guide_refresh if args.guide_refresh is not None else (t.get("guide_refresh", "") or 10))
+        S.guide_refresh = 0 if g <= 0 else max(2, g)
+    except ValueError:
+        log.warning(f"guide_refresh in {CONFIG_FILE.name} should be a number of minutes; using {S.guide_refresh}")
     S.access_key = t.get("access_key", "").strip()
     register_secret(S.access_key)          # never show the key in the log
     choice = args.player or ("ffplay" if args.ffplay else "vlc" if args.vlc else t.get("player", ""))
@@ -3048,7 +3427,8 @@ def serve(args, tablo, favs, port) -> None:
     announce(args, tablo, port)
     if args.lan and LiveTV.available():
         threading.Thread(target=choose_encoder, daemon=True).start()   # ready before the first phone/TV
-        start_guide_refresher(tablo, favs)           # keep /guide.xml ready for IPTV apps
+    # what's on now every guide_refresh minutes; + /guide.xml for IPTV apps with --lan
+    start_guide_refresher(tablo, favs, iptv=args.lan and LiveTV.available())
     if args.play:  # favorites / all playlist
         launch_player(f"{base}/{'playlist.m3u' if args.play.lower() == 'all' else 'favorites.m3u'}",
                       playlist=True)
@@ -3060,7 +3440,7 @@ def serve(args, tablo, favs, port) -> None:
         shutdown(server)
         return
     else:
-        print(f"Server running at {base}/  Ctrl+C to quit.")
+        print(color_addresses(f"Server running at {base}/  Ctrl+C to quit."))
     try:
         while True:
             threading.Event().wait(3600)
