@@ -167,6 +167,9 @@ KEEPS WORKING WHEN THINGS GO WRONG
   * Cleans up leftover temp files if it was ever killed mid-stream.
   * Plain-English error messages instead of tracebacks (for example, a DNS
     filter blocking Tablo's servers).
+  * Phone/TV/multi-view picture black? ./tablo-vlc.py --diagnose 2.1 checks
+    that channel step by step, from the Tablo to the converted picture.
+    --diagnose 2.1 11.1 also plays both at once, like multi-view.
 
 
 RESTART A STUCK TABLO (NEEDS A SMART PLUG YOU BUY SEPARATELY)
@@ -326,6 +329,17 @@ Once it worked on Linux, I kept going. The same single file now also covers:
     Full screen fills the screen with all of them. Your picks are
     remembered. On the desktop, w 4.1 in the menu opens a second VLC
     window instead.
+      * Channels start one after another (the Tablo tunes one at a time),
+        so with 4 the last one appears after about 20 seconds.
+      * Each picture has a stop/start button. Stop frees its Tablo tuner
+        right away; start tries again (handy if one didn't come up).
+        "Stop all" and "Start all" do every picture; leaving the page stops
+        them all.
+      * A bar at the top shows your Tablo's tuners, like t in the menu,
+        and turns red when none are free. Channels then wait and start by
+        themselves when a tuner frees up.
+      * If a channel can't start, its picture says why, e.g. "all Tablo
+        tuners busy".
       * Each channel uses its own Tablo tuner (2 channels = 2 tuners), so
         on a 2-tuner Tablo nothing else can record while you watch two.
       * Each channel is converted separately: 4 at once is heavy without a
@@ -425,17 +439,23 @@ Tested by me on a real Tablo 4th Gen:
   * Pop!_OS COSMIC   with VLC (Flatpak) and without VLC installed
   * Apple iPhone     Safari browser, watching through the web page
   * Samsung TV       AirPlay from the iPhone's Safari player
+  * Tuner status     t in the menu and the multi-view bar: the tuner
+                     count and the Tablo's own report of busy tuners
+                     (including tuners stuck on no channel)
+  * Multi-view       2 channels at once in Chrome on the PC (1.5.4)
   That covers the core: Tablo login, the channel list and guide, favorites,
   and live TV actually playing on the Linux desktop, on the iPhone, and on a
   Samsung TV via AirPlay (which also means the ffmpeg conversion works with
   real Tablo broadcasts).
 
 Also tested in simulation (a mock Tablo, plus a real VLC where noted).
-59 of these checks ship as an automated test suite in tests/:
+68 of these checks ship as an automated test suite in tests/:
   Linux desktop
   * Menu, columns, colors, favorites; --play, --info, --list, --tune,
     --max-channels; p (previous channel), the Recent line, /search,
     tuner status (t) and the "tuners busy" message
+  * The menu keeps taking typing while a channel plays (ffmpeg never reads
+    the terminal; checked in a real terminal session)
   * Two channels at once: second VLC window (w 4.1) with a real VLC: two
     windows, each switching channels on its own, each keeping its tuner
   * Request signing against the Tablo's local tuning endpoint
@@ -457,9 +477,13 @@ Also tested in simulation (a mock Tablo, plus a real VLC where noted).
   Bonus platforms
   * Windows code paths (checked on Linux)
   * Phone/TV conversion: 1080i MPEG-2 in, 720p/1080p H.264 + AAC out
+  * A Tablo that drops out mid-stream: the conversion restarts and the
+    playlist carries on (simulated 6-second outage)
   * Multi-view page: 2 and 4 players, one device watching several channels
     at once (each keeps its own converter and tuner), sound switching,
-    picks remembered
+    picks remembered; one-at-a-time start, stop/start per picture freeing
+    the tuner right away, Stop all / Start all, leaving the page; tuner
+    bar and waiting for a free tuner
   * Closed captions: a broadcast-style stream with real CEA-608 captions
     keeps them after the conversion; captions on/off on the TV page
   * Phone page and TV page (with remote keys) in phone- and TV-size browsers
@@ -490,10 +514,7 @@ Not tested on real hardware (built and simulation-tested only):
   * Graphics-chip (hardware) encoding: the test machine had no GPU, so only
     the detection and the software fallback were tested
   * The system keyring on a real desktop (tested with a stand-in)
-  * Multi-view with real video on a real PC, tablet or phone (the test
-    browser can't decode H.264; the page, players and streams were checked)
-  * Tuner status against a real Tablo: the tuner count, and whether the
-    4th Gen reports busy tuners (if it does, recordings get counted too)
+  * Multi-view with 4 channels, and on a tablet or phone
   * Closed captions shown on a real iPhone, Android phone or TV (the
     captions are verified inside the converted video; whether Safari shows
     them without extra playlist info is untested)
@@ -506,6 +527,7 @@ Shared as-is, with no support or warranty: this is what worked for me, not a
 maintained project. Tablo can change its service at any time, which may stop
 this from working. MIT licensed (see LICENSE).
 Unofficial; not affiliated with Tablo or Nuvyyo. Uses your own Tablo account.
-Builds on the open-source tablo-api and tablo2plex projects.
+Builds on the open-source tablo-api and tablo2plex projects, with lessons
+from TabloView's notes on the Tablo 4th Gen.
 Vibe coded with Claude (Anthropic) at 3am for about $10 in usage credits.
 -------------------------------------------------------------------------------

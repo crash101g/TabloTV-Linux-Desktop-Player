@@ -212,7 +212,7 @@ from pathlib import Path
 # SECTION 1: PLATFORM HELPERS
 # Small differences between Linux and Windows, kept in one place.
 # =============================================================================
-__version__ = "1.3.0"        # shown by --version and at the top of the log
+__version__ = "1.5.4"        # shown by --version and at the top of the log
 
 IS_WINDOWS = os.name == "nt"
 # How to run this script, for help text: Windows uses the py launcher.
@@ -745,7 +745,7 @@ class Tablo:
         self._active_lock = threading.Lock()
         self.tuner_total = int(self.cache.get("tuners") or 0)    # from /server/info
         self.model = self.cache.get("model", "")
-        self.tuner_states = None      # [True/False per tuner] if the Tablo reports it
+        self.tuner_states = None      # per tuner, if the Tablo reports it: see _parse_tuners
         if lan_only:
             if not self.cache.get("channels"):
                 raise NetworkError("No saved channel list yet. Run once with the internet connected "
@@ -1135,49 +1135,99 @@ class Tablo:
         try:
             raw = self._device_get("/server/tuners")
             log.debug(f"/server/tuners answered: {str(raw)[:300]}")
-            if isinstance(raw, list) and raw and all(isinstance(t, dict) for t in raw):
-                states = [bool(t.get("in_use", t.get("inUse", t.get("busy")))) for t in raw
-                          if any(k in t for k in ("in_use", "inUse", "busy"))]
-                if len(states) == len(raw):
-                    self.tuner_states = states
-                    self.tuner_total = self.tuner_total or len(states)
+            states = self._parse_tuners(raw)
+            if states is not None:
+                self.tuner_states = states
+                self.tuner_total = self.tuner_total or len(states)
         except Exception as e:
             log.debug(f"/server/tuners not available: {e}")
+
+    @staticmethod
+    def _parse_tuners(raw):
+        """The Tablo's /server/tuners answer, e.g. on a 4th Gen:
+          [{'in_use': True, 'channel': None, 'recording': None, 'channel_identifier': None}, ...]
+        -> [{'in_use', 'channel' (channel id or None), 'recording' (True/False)}], or None
+        if it isn't in that shape."""
+        if not (isinstance(raw, list) and raw and all(isinstance(t, dict) for t in raw)):
+            return None
+        out = []
+        for t in raw:
+            if not any(k in t for k in ("in_use", "inUse", "busy")):
+                return None
+            ch = t.get("channel_identifier") or t.get("channel") or None
+            if isinstance(ch, dict):
+                ch = ch.get("identifier") or ch.get("path")
+            if isinstance(ch, str) and "/" in ch:            # '/guide/channels/S123/...' -> 'S123'
+                parts = [p for p in ch.split("/") if p]
+                ch = parts[parts.index("channels") + 1] if "channels" in parts[:-1] else parts[-1]
+            out.append({"in_use": bool(t.get("in_use", t.get("inUse", t.get("busy")))),
+                        "channel": ch, "recording": bool(t.get("recording"))})
+        return out
 
     def tuner_status(self) -> dict:
         """{'total': 4 or 0 if unknown, 'ours': [(channel, who, since)], 'busy': n or None}.
         'busy' (all tuners in use, by anything) is only known if the Tablo reports it."""
         with self._active_lock:
             ours = [(self.by_id(a["ident"]), a["who"], a["since"]) for a in self.active.values()]
-        busy = None
+        busy = recording = idle = elsewhere = None
+        ours = [o for o in ours if o[0] and o[0].kind == "ota"]   # FAST doesn't use a tuner
         if self.tuner_states is not None:
             try:
-                fresh = self._device_get("/server/tuners")
-                self.tuner_states = [bool(t.get("in_use", t.get("inUse", t.get("busy")))) for t in fresh]
+                self.tuner_states = self._parse_tuners(self._device_get("/server/tuners")) or self.tuner_states
             except Exception:
                 pass
-            busy = sum(self.tuner_states)
-        # FAST channels come from the internet and don't use an antenna tuner
-        return {"total": self.tuner_total, "ours": [o for o in ours if o[0] and o[0].kind == "ota"],
-                "busy": busy}
+            used = [t for t in self.tuner_states if t["in_use"]]
+            busy = len(used)
+            mine = [c.identifier for c, _, _ in ours]
+            recording = sum(1 for t in used if t["recording"])
+            live = [t for t in used if not t["recording"]]
+            matched = sum(1 for t in live if t["channel"] and t["channel"] in mine)
+            elsewhere = sum(1 for t in live if t["channel"] and t["channel"] not in mine)
+            # In use, but on no channel and not recording. Our own tuners may show up like
+            # this too while starting, so those are subtracted. The rest are usually stuck.
+            no_channel = sum(1 for t in live if not t["channel"])
+            idle = max(0, no_channel - (len(ours) - matched))
+        return {"total": self.tuner_total, "ours": ours, "busy": busy,
+                "recording": recording, "stuck": idle, "elsewhere": elsewhere}
 
-    def tuner_summary(self) -> str:
-        """One line, e.g. 'Tuners: 2 of 4 in use by this script (9.1 KNINE, 4.1 KFOUR)'."""
+    def tuner_report(self) -> dict:
+        """Tuner status for web pages (/tuners.json): the menu's summary line plus
+        the numbers, so the multi-view page can show it and wait for a free tuner."""
         st = self.tuner_status()
+        free = None
+        if st["total"]:
+            used = st["busy"] if st["busy"] is not None else len(st["ours"])
+            free = max(0, st["total"] - used)
+        return {"summary": self.tuner_summary(st), "model": self.model, "total": st["total"],
+                "busy": st["busy"], "free": free, "busy_known": st["busy"] is not None,
+                "stuck": st.get("stuck") or 0,
+                "ours": [{"channel": (f"{c.major}.{c.minor} " if c.major else "") + c.call_sign,
+                          "who": who, "minutes": int((time.time() - since) // 60)}
+                         for c, who, since in st["ours"]]}
+
+    def tuner_summary(self, st: dict | None = None) -> str:
+        """One line, e.g. 'Tuners: 2 of 4 in use by this script (9.1 KNINE, 4.1 KFOUR)'."""
+        st = st or self.tuner_status()
         n, total = len(st["ours"]), st["total"]
         names = ", ".join(f"{c.major}.{c.minor} {c.call_sign}" if c.major else c.call_sign for c, _, _ in st["ours"])
         of = f" of {total}" if total else ""
-        if st["busy"] is not None:
-            others = max(0, st["busy"] - n)
-            line = f"Tuners: {st['busy']}{of} busy ({n} by this script" + (
-                f", {others} recording or on other TVs)" if others else ")")
-        else:
-            line = f"Tuners: {n}{of} in use by this script"
-        return line + (f" ({names})" if names else "")
+        if st["busy"] is not None:            # the Tablo reports every busy tuner
+            parts = [f"{n} by this script" + (f": {names}" if names else "")]
+            if st["recording"]:
+                parts.append(f"{st['recording']} recording")
+            if st["elsewhere"]:
+                parts.append(f"{st['elsewhere']} on other TVs or apps")
+            if st["stuck"]:
+                parts.append(f"{st['stuck']} busy with no channel – Tablo may be stuck")
+            return f"Tuners: {st['busy']}{of} busy ({'; '.join(parts)})"
+        return f"Tuners: {n}{of} in use by this script" + (f" ({names})" if names else "")
 
     def busy_hint(self) -> str:
         """Extra words for a failed tune: who's holding tuners, as far as we know."""
         st = self.tuner_status()
+        if st["busy"] is not None and st["total"] and st["busy"] >= st["total"]:
+            return (f" {self.tuner_summary(st)}." + (" A restart of the Tablo usually clears tuners stuck "
+                    "on no channel." if st["stuck"] else ""))
         n, total = len(st["ours"]), st["total"]
         if total and n >= total:
             return (f" All {total} tuners are in use by this script; stop one "
@@ -1504,10 +1554,15 @@ def choose_encoder() -> str:
 class LiveJob:
     """One running ffmpeg converter: which channel/quality, its Tablo session token,
     its temp folder of video segments, and who's watching (viewer IP -> last seen)."""
-    def __init__(self, ident, q, label, token, folder, proc, encoder="x264"):
+    def __init__(self, ident, q, label, token, folder, proc, encoder="x264", url="", height=0):
         self.ident, self.q, self.label, self.token, self.folder, self.proc = ident, q, label, token, folder, proc
         self.encoder = encoder
+        self.url, self.height = url, height     # the Tablo's stream, for restarts
         self.started = self.last = time.time()
+        self.slow_warned = False
+        self.stopped = False                     # set by _shutdown: don't restart it
+        self.gave_up = False                     # ffmpeg kept failing: tune the channel again
+        self.restarts = 0
         self.viewers: dict[str, float] = {}
 
 
@@ -1554,22 +1609,83 @@ class LiveTV:
         folder = Path(tempfile.mkdtemp(prefix="tablo-live-"))
         height = max(240, min(int(q), 2160))
         encoder = choose_encoder()
-        pre, vf, codec = encoder_args(encoder, height)
-        cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", *pre,
-               "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "10",
-               "-i", url, "-map", "0:v:0", "-map", "0:a:0?",
-               "-vf", vf, *codec,                              # deinterlace + scale + H.264
-               "-c:a", "aac", "-b:a", "160k", "-ac", "2",
-               "-f", "hls", "-hls_time", "2", "-hls_list_size", "8",
-               "-hls_flags", "delete_segments+independent_segments+omit_endlist",
-               "-hls_segment_filename", str(folder / "seg%05d.ts"), str(folder / "index.m3u8")]
-        proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                                stderr=subprocess.PIPE)
         label = ch.display_name if ch else ident
-        threading.Thread(target=lambda: [log.warning(f"[{label}] browser ffmpeg: {l.decode(errors='replace').rstrip()}")
-                                         for l in proc.stderr], daemon=True).start()
+        job = LiveJob(ident, q, label, token, folder, None, encoder, url=url, height=height)
+        job.proc = self._run(job)
+        log.debug(f"[{label}] Tablo stream: {url}")
         log.info(f"[{label}] converting for browser playback ({height}p, {encoder})")
-        return LiveJob(ident, q, label, token, folder, proc, encoder)
+        threading.Thread(target=self._supervise, args=(job,), daemon=True).start()
+        return job
+
+    @staticmethod
+    def _cmd(job, resume: bool = False) -> list:
+        """The ffmpeg command converting job's Tablo stream to H.264/AAC HLS in its folder:
+        deinterlaced, scaled, 2-second segments each starting on a keyframe. Gaps or
+        damage in the broadcast are dropped instead of decoded into garbage, and audio
+        is stretched over gaps. resume=True continues the same playlist after a restart
+        (same numbering, with a discontinuity mark), so players carry on."""
+        pre, vf, codec = encoder_args(job.encoder, job.height)
+        flags = "delete_segments+independent_segments+omit_endlist" + ("+append_list+discont_start" if resume else "")
+        return ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", *pre,
+                "-fflags", "+discardcorrupt",
+                "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "10",
+                "-i", job.url, "-map", "0:v:0", "-map", "0:a:0?",
+                "-vf", vf, *codec,                              # deinterlace + scale + H.264
+                "-force_key_frames", "expr:gte(t,n_forced*2)",
+                "-af", "aresample=async=1",
+                "-c:a", "aac", "-b:a", "160k", "-ac", "2",
+                "-f", "hls", "-hls_time", "2", "-hls_list_size", "8", "-hls_flags", flags,
+                "-hls_segment_filename", str(job.folder / "seg%05d.ts"), str(job.folder / "index.m3u8")]
+
+    def _run(self, job, resume: bool = False):
+        proc = subprocess.Popen(self._cmd(job, resume), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.PIPE)
+        threading.Thread(target=self._watch_errors, args=(job.label, proc), daemon=True).start()
+        return proc
+
+    MAX_RESTARTS = 4
+
+    def _supervise(self, job) -> None:
+        """Keep a channel going when ffmpeg stops mid-stream (the Tablo stops sending
+        for a moment, a Wi-Fi blip, a graphics-chip encoder failing): restart it in
+        the same folder, continuing the same playlist, so players (a few seconds
+        buffered) carry on instead of freezing on a playlist that started over.
+        After MAX_RESTARTS, give up; the next player request tunes the channel again."""
+        while not job.stopped:
+            began = time.time()
+            job.proc.wait()
+            if job.stopped:
+                return
+            if time.time() - began > 120:            # it ran fine for a while: a fresh count
+                job.restarts = 0
+            job.restarts += 1
+            if job.encoder != "x264" and (time.time() - job.started < 20 or job.restarts >= 2):
+                log.warning(f"{ENCODERS[job.encoder]['label']} failed on {job.label}; switching to software encoding")
+                S.encoder = job.encoder = "x264"
+            if job.restarts > self.MAX_RESTARTS:
+                log.warning(f"[{job.label}] conversion kept stopping; the channel will be tuned again")
+                job.gave_up = True
+                return
+            log.info(f"[{job.label}] video stopped (ffmpeg exit {job.proc.returncode}); "
+                     f"restarting ({job.restarts} of {self.MAX_RESTARTS})")
+            time.sleep(min(2 * job.restarts, 6))   # give a network blip a moment
+            if job.stopped:
+                return
+            has_playlist = (job.folder / "index.m3u8").exists()
+            job.proc = self._run(job, resume=has_playlist)
+
+    def _watch_errors(self, label, proc) -> None:
+        """Copy a converter's error output into the log, with a plain-English note
+        the first time it can't reach the Tablo at all."""
+        hinted = False
+        for line in proc.stderr:
+            text = line.decode(errors="replace").rstrip()
+            log.warning(f"[{label}] browser ffmpeg: {text}")
+            if not hinted and ("No route to host" in text or "timed out" in text):
+                hinted = True
+                log.warning(f"[{label}] This PC lost contact with the Tablo ({text.split('to ')[-1].split(' failed')[0]}). "
+                            f"That's the network or the Tablo itself: check Wi-Fi, or restart the Tablo "
+                            f"if it keeps happening.")
 
     # Locking rule: self.lock only guards the dictionaries. Anything slow
     # (tuning the Tablo, stopping ffmpeg, ending a Tablo session) happens with
@@ -1584,7 +1700,8 @@ class LiveTV:
         """(lock NOT held) Stop ffmpeg, free the Tablo tuner, delete the temp folder."""
         if not job:
             return
-        if job.proc.poll() is None:
+        job.stopped = True                       # the supervisor won't restart it
+        if job.proc and job.proc.poll() is None:
             job.proc.terminate()
             try:
                 job.proc.wait(timeout=5)
@@ -1595,19 +1712,29 @@ class LiveTV:
         log.info(f"[{job.label}] browser playback stopped")
 
     def touch(self, ident, viewer, q=None) -> LiveJob:
-        """Viewer is watching ident: start the converter if needed; stop the one
-        they just left if nobody else is on it."""
+        """Viewer is watching ident: start the converter if needed. If the viewer just
+        switched from another channel nobody else is watching, that one is stopped and
+        its tuner freed *before* tuning the new one, so a Tablo with few free tuners
+        doesn't count both and refuse the new channel."""
         key = (ident, int(q or S.browser_quality))
+        to_stop = []
+        with self.lock:
+            now = time.time()
+            prev = self.viewer_ch.get(viewer)
+            if prev and prev != key:
+                self.viewer_ch.pop(viewer, None)
+                old = self.jobs.get(prev)
+                if old:
+                    old.viewers.pop(viewer, None)
+                    if not any(now - t < 15 for t in old.viewers.values()):
+                        to_stop.append(self._detach(prev))
+        for old_job in to_stop:                             # free the old tuner first
+            self._shutdown(old_job)
         to_stop = []
         while True:
             with self.lock:
                 job = self.jobs.get(key)
-                if job and job.proc.poll() is not None:     # ffmpeg died: restart it
-                    if job.encoder != "x264" and time.time() - job.started < 20:
-                        # A GPU encoder that passed the test but chokes on this broadcast
-                        log.warning(f"{ENCODERS[job.encoder]['label']} failed on {job.label}; "
-                                    f"switching to software encoding")
-                        S.encoder = "x264"
+                if job and job.gave_up:                     # restarts didn't help: tune it again
                     to_stop.append(self._detach(key))
                     job = None
                 if job:
@@ -1617,6 +1744,8 @@ class LiveTV:
                     starting = self.starting[key] = threading.Event()
                     break
             starting.wait(timeout=30)                       # someone else is tuning it
+        for old_job in to_stop:
+            self._shutdown(old_job)
         if not job:
             try:
                 new = self._start(*key)                     # slow: Tablo tune + ffmpeg
@@ -1629,15 +1758,7 @@ class LiveTV:
             now = time.time()
             job.last = now
             job.viewers[viewer] = now
-            prev = self.viewer_ch.get(viewer)
             self.viewer_ch[viewer] = key
-            if prev and prev != key and prev in self.jobs:  # viewer switched channels
-                old = self.jobs[prev]
-                old.viewers.pop(viewer, None)
-                if not any(now - t < 15 for t in old.viewers.values()):
-                    to_stop.append(self._detach(prev))
-        for old_job in to_stop:
-            self._shutdown(old_job)
         return job
 
     def get(self, ident, q=None):
@@ -1645,14 +1766,58 @@ class LiveTV:
         return self.jobs.get((ident, int(q or S.browser_quality)))
 
     def _reaper(self) -> None:
-        """Every 10 s: stop converters nobody has fetched video from for IDLE seconds."""
+        """Every 10 s: stop converters nobody has fetched video from for IDLE seconds,
+        and warn (once) about any that can't keep up with real time."""
         while True:
             time.sleep(10)
             with self.lock:
                 idle = [self._detach(k) for k, j in list(self.jobs.items())
                         if time.time() - j.last > self.IDLE]
+                running = list(self.jobs.values())
             for job in idle:
                 self._shutdown(job)
+            for job in running:
+                self._check_speed(job)
+
+    def _check_speed(self, job) -> None:
+        """A converter makes one 2-second segment every 2 seconds when it keeps up.
+        Far fewer means no video is arriving from the Tablo, or the PC is too slow
+        for this many channels; either way the picture freezes, so say which."""
+        elapsed = time.time() - job.started
+        if job.slow_warned or elapsed < 40:
+            return
+        segs = [int(p.stem[3:]) for p in job.folder.glob("seg*.ts") if p.stem[3:].isdigit()]
+        made = (max(segs) + 1) if segs else 0
+        expected = (elapsed - 10) / 2
+        if made >= 0.7 * expected:
+            return
+        job.slow_warned = True
+        with self.lock:
+            others = len(self.jobs) - 1
+        if made == 0:
+            log.warning(f"[{job.label}] no video from the Tablo after {int(elapsed)} s: check this PC can "
+                        f"reach the Tablo, or restart the Tablo")
+        else:
+            log.warning(f"[{job.label}] converting slower than real time ({made} of ~{int(expected)} "
+                        f"segments in {int(elapsed)} s{f', with {others} other channel(s) converting' if others else ''}). "
+                        f"The PC may be too slow for this many: try fewer channels, the 4-channel view "
+                        f"(smaller pictures), or a graphics-chip encoder (encoder = vaapi / nvenc / qsv)")
+
+    def release(self, viewer) -> None:
+        """A player stopped (multi-view ■, or the page closed): forget this viewer
+        and, if nobody else is watching that channel, stop it and free its tuner
+        now rather than when the reaper notices a minute later."""
+        stop = None
+        with self.lock:
+            key = self.viewer_ch.pop(viewer, None)
+            job = self.jobs.get(key) if key else None
+            if job:
+                job.viewers.pop(viewer, None)
+                now = time.time()
+                if not any(now - t < 15 for t in job.viewers.values()):
+                    stop = self._detach(key)
+        if stop:
+            self._shutdown(stop)
 
     def stop_all(self) -> None:
         """Stop every converter (used when the script quits)."""
@@ -1785,6 +1950,13 @@ const ov = document.getElementById("ov"), v = document.getElementById("v"), info
 const ititle = document.getElementById("ititle"), ishow = document.getElementById("ishow"), istate = document.getElementById("istate");
 let hls = null, cur = -1, infoTimer = null;
 
+// Which player: Safari (iPhone, iPad, Mac) plays this stream itself, and needs to for
+// AirPlay. Everyone else uses hls.js, even when the browser claims it can play it
+// natively (newer Chrome says "maybe" but its built-in player stalled here).
+function useNative(v) {
+  return !!v.canPlayType("application/vnd.apple.mpegurl")
+         && (/Apple/.test(navigator.vendor || "") || !(window.Hls && Hls.isSupported()));
+}
 function showInfo(ms) { info.classList.remove("hide"); clearTimeout(infoTimer); infoTimer = setTimeout(() => info.classList.add("hide"), ms || 5000); }
 function stop() { if (hls) { hls.destroy(); hls = null; } v.pause(); v.removeAttribute("src"); v.load(); }
 function play(i) {
@@ -1795,9 +1967,10 @@ function play(i) {
     try { (document.documentElement.requestFullscreen || document.documentElement.webkitRequestFullscreen || function(){}).call(document.documentElement); } catch (e) {} }
   ititle.textContent = t.dataset.label; ishow.textContent = t.dataset.show || ""; istate.textContent = "Tuning…"; showInfo(8000);
   const src = "/live/" + encodeURIComponent(t.dataset.id) + "/" + TVQ + "/index.m3u8" + (KEY ? "?key=" + encodeURIComponent(KEY) : "");
-  if (v.canPlayType("application/vnd.apple.mpegurl")) { v.src = src; }
+  if (useNative(v)) { v.src = src; }
   else if (window.Hls && Hls.isSupported()) {
     hls = new Hls({liveSyncDurationCount: 3, manifestLoadingMaxRetry: 6, manifestLoadingRetryDelay: 1500,
+                   manifestLoadingTimeOut: 30000, levelLoadingTimeOut: 30000,   // tuning can take ~20 s
                    enableCEA708Captions: true});      // the broadcast's closed captions
     hls.on(Hls.Events.ERROR, (e, d) => { if (d.fatal) { istate.textContent = "Playback error (" + d.details + ")"; showInfo(10000); } });
     hls.loadSource(src); hls.attachMedia(v);
@@ -1939,6 +2112,13 @@ function stopVideo() {
   video.pause(); video.removeAttribute("src"); video.load();
 }
 // Watch right here in the browser (phones, tablets, or a PC with no player).
+// Which player: Safari (iPhone, iPad, Mac) plays this stream itself, and needs to for
+// AirPlay. Everyone else uses hls.js, even when the browser claims it can play it
+// natively (newer Chrome says "maybe" but its built-in player stalled here).
+function useNative(v) {
+  return !!v.canPlayType("application/vnd.apple.mpegurl")
+         && (/Apple/.test(navigator.vendor || "") || !(window.Hls && Hls.isSupported()));
+}
 function watchHere(id, label) {
   current = {id: id, label: label};
   if (castSession() && castLoad(current)) return;      // already casting: send it to the TV
@@ -1946,10 +2126,11 @@ function watchHere(id, label) {
   player.style.display = "block"; window.scrollTo(0, 0);
   ptitle.textContent = label; pstate.textContent = "Tuning… (takes a few seconds)";
   const src = "/live/" + encodeURIComponent(id) + "/index.m3u8" + (TABLO.key ? "?key=" + encodeURIComponent(TABLO.key) : "");
-  if (video.canPlayType("application/vnd.apple.mpegurl")) {          // iPhone/iPad Safari
+  if (useNative(video)) {                                            // iPhone/iPad Safari
     video.src = src;
   } else if (window.Hls && Hls.isSupported()) {                        // Android Chrome, desktop
     hls = new Hls({liveSyncDurationCount: 3, manifestLoadingMaxRetry: 6, manifestLoadingRetryDelay: 1500,
+                   manifestLoadingTimeOut: 30000, levelLoadingTimeOut: 30000,   // tuning can take ~20 s
                    enableCEA708Captions: true});      // the broadcast's closed captions
     hls.on(Hls.Events.ERROR, (e, d) => { if (d.fatal) pstate.textContent = "Playback error (" + d.details + ")"; });
     hls.loadSource(src); hls.attachMedia(video);
@@ -2042,25 +2223,38 @@ button.sel{background:var(--acc);border-color:var(--acc);color:#fff}
 .vid{position:relative} video{width:100%;aspect-ratio:16/9;background:#000;border-radius:6px;display:block;cursor:pointer}
 .st{position:absolute;left:8px;bottom:8px;color:#fff;font-size:13px;background:rgba(0,0,0,.55);padding:2px 8px;border-radius:5px}
 .st:empty{display:none} .note{color:var(--mute);font-size:13px;margin-top:10px}
+.ss{padding:4px 10px;font-size:14px;min-width:38px}
+.dbg{margin-top:10px} .dbg pre{background:var(--tile);padding:8px;border-radius:8px;font-size:12px;max-height:40vh;overflow:auto;white-space:pre-wrap}
+.tuners{font-size:14px;color:var(--mute);margin:0 0 10px;padding:6px 10px;border-radius:8px;background:var(--tile)}
+.tuners.full{color:#fff;background:#b3261e} .tuners b{color:var(--fg)} .tuners.full b{color:#fff}
+#grid.g4 video{max-height:calc((100vh - 190px) / 2);object-fit:contain}   /* all 4 fit on screen */
+#grid.g4:fullscreen video{max-height:calc((100vh - 110px) / 2)}
 </style></head><body>
 <div class="top"><h1>Multi-view</h1>
 <button id="n2" type="button">2 channels</button><button id="n4" type="button">4 channels</button>
+<button id="all" type="button">▶ Start all</button><button id="none" type="button">■ Stop all</button>
 <button id="fs" type="button">⛶ Full screen</button><a href="/">Channel list</a></div>
+<div id="tuners" class="tuners">Checking your Tablo's tuners…</div>
 <div id="grid"></div>
-<p class="note">Tap a picture to hear it (one channel has sound at a time). Each channel uses one of your Tablo's
-tuners, so 2 channels need 2 free tuners and 4 need 4. They stop about a minute after you close this page.</p>
+<div id="dbg" class="dbg" hidden><div class="bar"><b>Player log</b> <button id="dbgcopy" type="button">Copy log</button></div><pre id="dbglog"></pre></div>
+<p class="note">Tap a picture to hear it (one channel has sound at a time). Channels start one after another,
+because your Tablo tunes one at a time. ■ stops a channel and frees its Tablo tuner right away; ▶ starts it
+again (also a good way to retry). Each playing channel uses one tuner, so 4 channels need 4 free tuners.
+Leaving this page stops them all.</p>
 <script src="/hls.min.js"></script>
 <script>
 const CH = %%CHANNELS%%, KEY = %%KEY%%;
 const grid = document.getElementById("grid");
-let n = 2, audio = 0, tiles = [], picks = [];
+// audio = which picture has sound; -1 = none yet. Browsers only allow sound after you
+// tap the page, so every picture starts muted and the first tap picks the sound.
+let n = 2, audio = -1, tiles = [], picks = [], queue = [], busy = null;
 try { const s = JSON.parse(localStorage.getItem("tablo-multi") || "{}"); n = s.n === 4 ? 4 : 2; picks = s.picks || []; } catch (e) {}
 const q = new URLSearchParams(location.search);
 if (q.get("n") === "4") n = 4; if (q.get("ch")) picks = q.get("ch").split(",");
 function save() { try { localStorage.setItem("tablo-multi", JSON.stringify({n: n, picks: picks})); } catch (e) {} }
+const keyq = KEY ? "&key=" + encodeURIComponent(KEY) : "";
 function src(id, slot) {             // 4 at once: smaller pictures (540p) to keep the PC's work down
-  return "/live/" + encodeURIComponent(id) + (n > 2 ? "/540" : "") + "/index.m3u8?slot=" + slot
-         + (KEY ? "&key=" + encodeURIComponent(KEY) : "");
+  return "/live/" + encodeURIComponent(id) + (n > 2 ? "/540" : "") + "/index.m3u8?slot=" + slot + keyq;
 }
 function options(sel) {
   let group = null, og = null;
@@ -2070,58 +2264,213 @@ function options(sel) {
     og.appendChild(new Option(c.label + (c.show ? " · " + c.show : ""), c.id));
   }
 }
-function stopTile(t) { if (t.hls) { t.hls.destroy(); t.hls = null; } t.v.pause(); t.v.removeAttribute("src"); t.v.load(); }
-function load(i) {
-  const t = tiles[i]; stopTile(t); picks[i] = t.sel.value; save();
-  if (!t.sel.value) { t.st.textContent = ""; return; }
-  t.st.textContent = "Tuning…";
-  const url = src(t.sel.value, i + 1);
-  if (t.v.canPlayType("application/vnd.apple.mpegurl")) t.v.src = url;
+function status(d) {                     // HTTP status of a failed load, however hls.js reports it
+  return (d.response && d.response.code) || (d.networkDetails && d.networkDetails.status) || 0;
+}
+function reason(d) {                     // a readable cause for a player error
+  const code = status(d);
+  if (code === 503) return "Couldn't tune this channel (all Tablo tuners busy?)";
+  if (code === 504) return "No video from the Tablo yet (network or Tablo problem? see tablo-vlc.log)";
+  if (code === 502) return "The conversion stopped (see tablo-vlc.log)";
+  if (code === 501) return "Needs ffmpeg on the PC";
+  if (code === 401) return "Needs the access key";
+  return d.details;
+}
+// Tell the PC to stop converting a slot's channel and free its Tablo tuner now
+// (instead of about a minute later when it notices nobody is watching).
+function release(slots) {
+  const url = "/multi/stop?slot=" + slots + keyq;
+  try { navigator.sendBeacon ? navigator.sendBeacon(url) : fetch(url, {method: "POST", keepalive: true}); } catch (e) {}
+}
+function stopTile(t, free) {
+  t.started = false; t.on = false; clearTimeout(t.timer);
+  if (t.hls) { t.hls.destroy(); t.hls = null; }
+  t.v.pause(); t.v.removeAttribute("src"); t.v.load();
+  if (free) release(t.slot);
+  queue = queue.filter(x => x !== t);
+  if (busy === t) { busy = null; next(); }
+  paint(t);
+}
+function paint(t) {                       // the ▶ / ■ button and the status text
+  const active = t.on || queue.includes(t);           // playing, or waiting its turn
+  t.btn.textContent = active ? "■" : "▶";
+  t.btn.title = active ? "Stop this channel (frees its tuner)" : "Start this channel";
+  if (!t.on && !queue.includes(t)) t.st.textContent = t.sel.value ? "Stopped" : "";
+}
+// Start channels one at a time: the Tablo tunes one channel at a time, and starting
+// several conversions at once also slows the PC. The next one starts when this one
+// plays, fails, or after 25 seconds.
+function want(t) {
+  if (!t.sel.value || t.on || queue.includes(t) || busy === t) return;
+  queue.push(t); paint(t); t.st.textContent = "Waiting to start…"; next();
+}
+// Tuner status from the PC (same as the menu's t), every 10 s. When the Tablo says
+// every tuner is busy, waiting channels hold instead of failing, and start by
+// themselves when one frees up.
+let tunerFree = null;
+const tbar = document.getElementById("tuners");
+async function tuners() {
+  try {
+    const r = await fetch("/tuners.json" + (KEY ? "?key=" + encodeURIComponent(KEY) : ""), {cache: "no-store"});
+    const t = await r.json();
+    tunerFree = t.busy_known ? t.free : null;
+    let html = "<b>" + esc(t.summary) + "</b>";
+    if (t.model) html = esc(t.model) + " · " + html;
+    if (t.free === 0) html += " – no free tuner right now" + (queue.length ? "; waiting channels start when one frees up" : "");
+    if (t.stuck) html += ". Tuners busy on no channel usually mean the Tablo is stuck: if it lasts more than a few "
+                       + "minutes, restart the Tablo (or use --restart-tablo with a smart plug).";
+    tbar.innerHTML = html; tbar.classList.toggle("full", t.free === 0);
+  } catch (e) { tbar.textContent = "Couldn't read the tuner status."; tunerFree = null; }
+  next();
+}
+function esc(s) { return String(s).replace(/[&<>"]/g, c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;"})[c]); }
+function next() {
+  if (busy || !queue.length) return;
+  if (tunerFree === 0) {                 // every tuner busy: hold, tuners() retries
+    queue.forEach(t => t.st.textContent = "Waiting for a free Tablo tuner…");
+    return;
+  }
+  busy = queue.shift(); begin(busy);
+  busy.timer = setTimeout(() => { if (busy) { busy = null; next(); } }, 25000);
+}
+function done(t) { if (busy === t) { clearTimeout(t.timer); busy = null; tuners(); } }
+// Which player: Safari (iPhone, iPad, Mac) plays this stream itself, and needs to for
+// AirPlay. Everyone else uses hls.js, even when the browser claims it can play it
+// natively (newer Chrome says "maybe" but its built-in player stalled here).
+function useNative(v) {
+  return !!v.canPlayType("application/vnd.apple.mpegurl")
+         && (/Apple/.test(navigator.vendor || "") || !(window.Hls && Hls.isSupported()));
+}
+function begin(t, retry) {
+  if (!retry) { t.tries = 0; t.mediaTries = 0; }
+  t.on = true; paint(t);
+  if (!retry) t.st.textContent = "Tuning…";
+  const url = src(t.sel.value, t.slot);
+  if (useNative(t.v)) { t.v.src = url; note("P" + t.slot + " using the browser's own player"); }
   else if (window.Hls && Hls.isSupported()) {
-    t.hls = new Hls({liveSyncDurationCount: 3, manifestLoadingMaxRetry: 6, manifestLoadingRetryDelay: 1500});
-    t.hls.on(Hls.Events.ERROR, (e, d) => { if (d.fatal) t.st.textContent = "Error (" + d.details + ") – all tuners busy?"; });
+    // The PC answers within ~25 s (tune + first video), so wait up to 30 s, and let
+    // failed() do the retrying so each try's reason shows on the picture.
+    t.hls = new Hls({liveSyncDurationCount: 3, manifestLoadingMaxRetry: 0,
+                     manifestLoadingTimeOut: 30000, levelLoadingTimeOut: 30000});
+    t.hls.on(Hls.Events.ERROR, (e, d) => { if (d.fatal) failed(t, d); });
+    if (DEBUG) watchPlayer(t);
     t.hls.loadSource(url); t.hls.attachMedia(t.v);
-  } else { t.st.textContent = "This browser can't play live video."; return; }
-  t.v.muted = i !== audio; t.v.play().catch(() => {});
+  } else { t.st.textContent = "This browser can't play live video."; t.on = false; paint(t); done(t); return; }
+  t.v.muted = tiles.indexOf(t) !== audio;
+  t.v.play().catch(e => note("P" + t.slot + " play refused: " + e.name));
+}
+// A player gave up: show why on the picture, let the next channel start, and retry
+// this one a few times (or press ▶ later).
+function failed(t, d) {
+  if (d.type === Hls.ErrorTypes.MEDIA_ERROR && t.mediaTries++ < 2) { t.hls.recoverMediaError(); return; }
+  const why = reason(d);
+  setTimeout(() => {                       // not from inside the player's own event
+    if (!t.on) return;
+    done(t);                               // don't hold up the other channels
+    if (t.hls) { t.hls.destroy(); t.hls = null; }
+    if (t.tries++ < 3) {
+      t.st.textContent = why + " – trying again (" + t.tries + " of 3)…";
+      t.timer = setTimeout(() => { if (t.on) begin(t, true); }, 3000);
+    } else {
+      stopTile(t, true); t.st.textContent = why + " – press ▶ to try again";
+    }
+  }, 0);
 }
 function setAudio(i) {
   audio = i;
   tiles.forEach((t, j) => { t.v.muted = j !== i; t.el.classList.toggle("on", j === i);
                             t.snd.textContent = j === i ? "🔊 sound" : "🔇 tap for sound"; });
-  tiles[i].v.play().catch(() => {});
+  // a tap is what lets the browser play with sound: (re)start every running picture now
+  tiles.forEach(t => { if (t.on) t.v.play().catch(e => note("P" + t.slot + " play refused: " + e.name)); });
 }
 function build() {
-  tiles.forEach(stopTile); grid.innerHTML = ""; tiles = [];
+  // 4 -> 2: free slots 3 and 4. Slots that stay reuse their running channel.
+  tiles.forEach(t => stopTile(t, t.slot > n)); grid.innerHTML = ""; tiles = []; queue = []; busy = null;
   grid.className = "g" + n;
   document.getElementById("n2").classList.toggle("sel", n === 2);
   document.getElementById("n4").classList.toggle("sel", n === 4);
-  const defaults = CH.map(c => c.id);
   for (let i = 0; i < n; i++) {
     const el = document.createElement("div"); el.className = "tile";
-    el.innerHTML = '<div class="bar"><select></select><span class="snd"></span></div>'
+    el.innerHTML = '<div class="bar"><button class="ss" type="button"></button><select></select><span class="snd"></span></div>'
                  + '<div class="vid"><video playsinline muted autoplay x-webkit-airplay="allow"></video><span class="st"></span></div>';
     grid.appendChild(el);
     const t = {el: el, sel: el.querySelector("select"), v: el.querySelector("video"), st: el.querySelector(".st"),
-               snd: el.querySelector(".snd"), hls: null};
+               snd: el.querySelector(".snd"), btn: el.querySelector(".ss"), hls: null, slot: i + 1, on: false};
     options(t.sel);
-    const want = picks[i] && CH.some(c => c.id === picks[i]) ? picks[i]
-               : defaults.find(id => !picks.slice(0, i).includes(id) && !tiles.some(x => x.sel.value === id)) || "";
-    t.sel.value = want;
-    t.sel.onchange = () => load(tiles.indexOf(t));
+    const want_id = picks[i] && CH.some(c => c.id === picks[i]) ? picks[i]
+                  : CH.map(c => c.id).find(id => !picks.slice(0, n).includes(id) && !tiles.some(x => x.sel.value === id)) || "";
+    t.sel.value = want_id; picks[i] = want_id;
+    // a new channel in this slot replaces the old one (the PC frees the old tuner itself)
+    t.sel.onchange = () => { picks[i] = t.sel.value; save(); stopTile(t, false); want(t); };
+    t.btn.onclick = () => { if (t.on || queue.includes(t)) { stopTile(t, true); } else want(t); };
     t.v.onclick = t.snd.onclick = () => setAudio(tiles.indexOf(t));
-    t.v.addEventListener("playing", () => t.st.textContent = "");
-    t.v.addEventListener("waiting", () => t.st.textContent = "Buffering…");
-    tiles.push(t);
+    t.v.addEventListener("playing", () => { t.st.textContent = ""; t.started = true; done(t); });
+    t.v.addEventListener("waiting", () => { if (t.started) t.st.textContent = "Buffering…"; });
+    // Video arrived but the browser didn't start it (autoplay rules): start it now, muted
+    // if need be; if even that's refused, ask for a tap.
+    t.v.addEventListener("canplay", () => {
+      if (!t.on || !t.v.paused) return;
+      t.v.play().catch(() => { t.v.muted = true; t.v.play().catch(() => t.st.textContent = "Tap the picture to start"); });
+    });
+    tiles.push(t); paint(t);
   }
-  tiles.forEach((t, i) => load(i));
-  setAudio(Math.min(audio, n - 1));
+  save();
+  tiles.forEach(want);
+  if (audio >= 0) setAudio(Math.min(audio, n - 1));
+  else tiles.forEach(t => t.snd.textContent = "🔇 tap for sound");
 }
 document.getElementById("n2").onclick = () => { n = 2; save(); build(); };
 document.getElementById("n4").onclick = () => { n = 4; save(); build(); };
+document.getElementById("all").onclick = () => tiles.forEach(want);
+document.getElementById("none").onclick = () => { tiles.forEach(t => stopTile(t, false)); release("all"); };
 document.getElementById("fs").onclick = () => {
   const f = grid.requestFullscreen || grid.webkitRequestFullscreen; if (f) f.call(grid);
 };
-build();
+window.addEventListener("pagehide", () => release("all"));      // leaving the page frees the tuners
+// ---- ?debug: a log of what each player does, to copy into a bug report --------
+// (open /multi?debug). Shows the browser, the player library, every player event
+// and, every 3 s, each video's state: is it moving, does it have a picture size.
+const DEBUG = new URLSearchParams(location.search).has("debug");
+const dbg = [];
+function note(msg) {
+  if (!DEBUG) return;
+  const line = new Date().toTimeString().slice(0, 8) + " " + msg;
+  dbg.push(line); if (dbg.length > 400) dbg.shift();
+  const pre = document.getElementById("dbglog"); pre.textContent = dbg.join("\n"); pre.scrollTop = 1e9;
+}
+function watchPlayer(t) {
+  const n = "P" + t.slot + " ";
+  [["MANIFEST_PARSED", d => "playlist ok, " + (d.levels || []).length + " level(s)"],
+   ["LEVEL_LOADED", d => "playlist refresh: " + (d.details && d.details.fragments.length) + " segments, live=" + (d.details && d.details.live)],
+   ["FRAG_LOADED", d => "segment " + (d.frag && d.frag.sn) + " loaded (" + Math.round(((d.frag && d.frag.stats && d.frag.stats.loaded) || (d.payload && d.payload.byteLength) || 0) / 1024) + " KB)"],
+   ["BUFFER_CODECS", d => "codecs " + JSON.stringify(Object.fromEntries(Object.entries(d).map(([k, v]) => [k, v && v.codec])))],
+   ["FRAG_BUFFERED", d => "segment " + (d.frag && d.frag.sn) + " buffered"],
+   ["ERROR", d => "ERROR " + d.type + " " + d.details + (d.fatal ? " (fatal)" : "") + (d.response ? " http " + d.response.code : "")
+                  + (d.reason ? " " + d.reason : "") + (d.error ? " " + d.error : "")]]
+    .forEach(([ev, f]) => t.hls.on(Hls.Events[ev], (e, d) => { try { note(n + f(d)); } catch (err) { note(n + ev); } }));
+  ["playing", "waiting", "stalled", "error", "loadedmetadata"].forEach(ev =>
+    t.v.addEventListener(ev, () => note(n + "video " + ev + (ev === "error" && t.v.error ? " code " + t.v.error.code + " " + t.v.error.message : ""))));
+}
+if (DEBUG) {
+  document.getElementById("dbg").hidden = false;
+  note("browser: " + navigator.userAgent);
+  note("player library: " + (window.Hls ? "hls.js " + Hls.version + ", supported=" + Hls.isSupported() : "NOT LOADED"));
+  note("native HLS: " + (document.createElement("video").canPlayType("application/vnd.apple.mpegurl") || "no")
+       + "; H.264 in MSE: " + (window.MediaSource && MediaSource.isTypeSupported('video/mp4; codecs="avc1.64001f,mp4a.40.2"')));
+  setInterval(() => tiles.forEach(t => { if (t.on) {
+    const b = t.v.buffered, ranges = []; for (let i = 0; i < b.length; i++) ranges.push(b.start(i).toFixed(1) + "-" + b.end(i).toFixed(1));
+    note("P" + t.slot + " state: time " + t.v.currentTime.toFixed(1) + " paused=" + t.v.paused + " ready=" + t.v.readyState
+         + " size " + t.v.videoWidth + "x" + t.v.videoHeight + " buffered [" + ranges.join(", ") + "] muted=" + t.v.muted);
+  } }), 3000);
+  document.getElementById("dbgcopy").onclick = () => {
+    const text = dbg.join("\n");
+    (navigator.clipboard ? navigator.clipboard.writeText(text) : Promise.reject()).catch(() => {
+      const r = document.createRange(); r.selectNodeContents(document.getElementById("dbglog"));
+      getSelection().removeAllRanges(); getSelection().addRange(r); });
+  };
+}
+tuners().then(build);                     // know the tuner situation before starting anything
+setInterval(tuners, 10000);
 </script></body></html>"""
 
 
@@ -2295,6 +2644,8 @@ def make_handler(tablo: Tablo, favs: Favorites, port: int):
                 host = self.headers.get("Host", f"127.0.0.1:{port}")
                 return self.send_body(tv_m3u(tablo, favs, host, path == "/tv-favorites.m3u"),
                                       "audio/x-mpegurl", cors=True)
+            if path == "/tuners.json":                  # tuner status for the multi-view page
+                return self.send_body(json.dumps(tablo.tuner_report()).encode(), "application/json")
             if path in ("/multi", "/multi/"):
                 if not LiveTV.available():
                     return self.send_body(b"Install ffmpeg on the PC for multi-view.", "text/plain", 501)
@@ -2346,13 +2697,20 @@ def make_handler(tablo: Tablo, favs: Favorites, port: int):
                 # Wait (up to ~25 s) for ffmpeg's first segment: answering with an empty
                 # playlist makes some players give up instead of retrying.
                 for _ in range(100):                      # first segments take a few seconds
-                    if playlist.exists() and b".ts" in playlist.read_bytes():
-                        break
-                    if job.proc.poll() is not None:
-                        return self.send_body(b"Converter stopped; check tablo-vlc.log", "text/plain", 503)
+                    if playlist.exists() and playlist.read_bytes().count(b".ts") >= 2:
+                        break                             # 2 segments: players start smoothly
+                    if job.proc.poll() is not None:     # 502: the conversion itself stopped
+                        return self.send_body(b"Converter stopped; check tablo-vlc.log", "text/plain", 502)
                     time.sleep(0.25)
                 else:
-                    return self.send_body(b"Still starting; try again", "text/plain", 503)
+                    # 504: tuned, but no video arrived from the Tablo. Usually the PC can't
+                    # reach the Tablo's video (network) or the Tablo is stuck; not tuners.
+                    if time.time() - job.started > 20:
+                        log.warning(f"[{ch.display_name}] no video from the Tablo after "
+                                    f"{int(time.time() - job.started)} s. Check this PC can reach the Tablo "
+                                    f"({urllib.parse.urlsplit(tablo.device_url).hostname}); "
+                                    f"if it keeps happening, restart the Tablo.")
+                    return self.send_body(b"No video from the Tablo yet", "text/plain", 504)
                 body = playlist.read_bytes()
                 # Players don't send cookies for segments, and the slot must come along
                 # too: add ?key=…&slot=N to each segment line.
@@ -2415,9 +2773,16 @@ def make_handler(tablo: Tablo, favs: Favorites, port: int):
 
         def do_POST(self):
             """POST /play/<id>: open a channel in the player on this PC (from the web page).
-            POST /refresh-guide: fetch what's on now again (web button, --refresh-guide)."""
+            POST /refresh-guide: fetch what's on now again (web button, --refresh-guide).
+            POST /multi/stop?slot=N|all: a multi-view player stopped; free its tuner now."""
             if not self.authorized():
                 return self.deny()
+            if self.path.split("?")[0] == "/multi/stop":       # multi-view ■ / Stop all / page closed
+                want = self.query_value("slot")
+                slots = ["1", "2", "3", "4"] if want == "all" else [want] if want in ("1", "2", "3", "4") else []
+                for slot in slots:
+                    live.release(f"{self.client_address[0]}#{slot}")
+                return self.send_body(b"ok", "text/plain")
             if self.path.split("?")[0] == "/refresh-guide":    # Refresh guide button / --refresh-guide
                 now = tablo.refresh_guide()
                 return self.send_body(json.dumps({"updated": tablo.guide_time(), "channels": len(now)}).encode(),
@@ -2483,11 +2848,14 @@ def make_handler(tablo: Tablo, favs: Favorites, port: int):
                 return
 
             log.info(f"[{ch.display_name}] tuned, streaming to {self.client_address[0]}")
+            # -nostdin + stdin=DEVNULL: ffmpeg must never read the terminal. Otherwise it
+            # swallows what you type in the channel menu (and could stop on a 'q') until
+            # the player closes.
             proc = subprocess.Popen(
-                ["ffmpeg", "-hide_banner", "-loglevel", "error",
+                ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin",
                  "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "10",
                  "-i", url, "-c", "copy", "-f", "mpegts", "pipe:1"],
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             )
             threading.Thread(target=lambda: [log.warning(f"[{ch.display_name}] ffmpeg: {l.decode(errors='replace').rstrip()}")
                                              for l in proc.stderr], daemon=True).start()
@@ -2631,7 +2999,7 @@ def find_flatpak_vlc() -> list | None:
     fp = shutil.which("flatpak")
     if fp:
         try:
-            if subprocess.run([fp, "info", FLATPAK_VLC_ID], stdout=subprocess.DEVNULL,
+            if subprocess.run([fp, "info", FLATPAK_VLC_ID], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                               stderr=subprocess.DEVNULL, timeout=5).returncode == 0:
                 return [fp, "run", FLATPAK_VLC_ID]
         except Exception:
@@ -3055,15 +3423,206 @@ def print_tuners(tablo, detail: bool = False) -> None:
     if not st["ours"]:
         print("  None in use by this script.")
     if st["busy"] is not None:
-        others = max(0, st["busy"] - len(st["ours"]))
-        print(f"  The Tablo reports {st['busy']} busy in all"
-              + (f": {others} recording or on other TVs." if others else "."))
+        print(f"  The Tablo reports {st['busy']} busy in all: {st['recording']} recording, "
+              f"{st['elsewhere']} on other TVs or apps, {len(st['ours'])} by this script"
+              + (f", {st['stuck']} on no channel." if st["stuck"] else "."))
+        if st["stuck"]:
+            print("  Tuners that stay busy with no channel usually mean the Tablo is stuck. Give it a few\n"
+                  "  minutes; if it stays that way, restart the Tablo (or --restart-tablo with a smart plug).")
     else:
         free = st["total"] - len(st["ours"]) if st["total"] else None
         print((f"  {free} free, as far as this script can tell. " if free is not None else "  ")
               + "Recordings and the Tablo app on other TVs don't show up here.")
     if not S.use_ffmpeg:
         print("  (Direct mode: a channel stays listed until you switch channels or quit.)")
+
+
+# --- --diagnose CH: one channel's whole path, step by step ----------------------
+def cmd_diagnose(tablo, ch) -> None:
+    """Tune one channel and check every step between the Tablo and a browser, printing
+    what happened: the stream address, the Tablo's playlist and video, what's in the
+    broadcast, and a 20-second test conversion (does it keep up, is the picture black).
+    Uses one tuner for about a minute and frees it at the end. Read-only otherwise."""
+    import shutil as _sh
+    out = []
+
+    def say(line):
+        print(line)
+        out.append(line)
+
+    def streams(target, timeout=40) -> str:
+        """'video mpeg2video 1920x1080 top first 29.97 fps; audio ac3' for a stream or file."""
+        r = subprocess.run(["ffprobe", "-v", "error", "-show_streams", "-of", "json", str(target)],
+                           stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout)
+        try:
+            found, seen = [], set()
+            for st in json.loads(r.stdout).get("streams", []):
+                if st.get("index") in seen:
+                    continue
+                seen.add(st.get("index"))
+                if st.get("codec_type") == "video":
+                    num, _, den = (st.get("r_frame_rate") or "0/1").partition("/")
+                    fps = float(num) / float(den or 1) if float(den or 1) else 0
+                    found.append(f"video {st.get('codec_name')} {st.get('profile', '')} {st.get('width')}x{st.get('height')}"
+                                 f" {st.get('field_order', '')} {fps:.2f} fps {st.get('pix_fmt', '')}".replace("  ", " "))
+                elif st.get("codec_type") == "audio":
+                    found.append(f"audio {st.get('codec_name')} {st.get('channels', '')}ch")
+            return "; ".join(found) or "nothing found"
+        except Exception:
+            return f"couldn't read it: {r.stderr.strip()[-200:]}"
+    say(f"\nDiagnosing {ch.display_name} (tablo-vlc {__version__})")
+    t0 = time.time()
+    try:
+        url, token = tablo.watch_session(ch.identifier, who="diagnose")
+    except Exception as e:
+        say(f"  1. Tune: FAILED: {e}.{tablo.busy_hint()}")
+        return
+    say(f"  1. Tune: OK in {time.time() - t0:.1f} s")
+    folder = Path(tempfile.mkdtemp(prefix="tablo-diag-"))
+    try:
+        parts = urllib.parse.urlsplit(url)
+        say(f"  2. Stream address: {parts.scheme}://{parts.hostname}:{parts.port or 80}"
+            f"{' (the Tablo)' if parts.hostname == urllib.parse.urlsplit(tablo.device_url).hostname else ''}")
+        try:
+            with urllib.request.urlopen(url, timeout=10) as r:
+                text = r.read().decode("utf-8", "replace")
+            segs = [l.strip() for l in text.splitlines() if l.strip() and not l.startswith("#")]
+            say(f"  3. Tablo playlist: OK, {len(segs)} entries" + (", ends (#EXT-X-ENDLIST)" if "ENDLIST" in text else ", live"))
+            if segs:
+                seg_url = urllib.parse.urljoin(url, segs[-1])
+                sp = urllib.parse.urlsplit(seg_url)
+                if seg_url.endswith(".m3u8") or ".m3u8?" in seg_url:
+                    say(f"     It points to another playlist at {sp.hostname}:{sp.port or 80}")
+                else:
+                    t1 = time.time()
+                    with urllib.request.urlopen(seg_url, timeout=10) as r:
+                        n = len(r.read())
+                    say(f"  4. Tablo video segment: OK, {n // 1024} KB in {time.time() - t1:.1f} s "
+                        f"from {sp.hostname}:{sp.port or 80}")
+        except Exception as e:
+            say(f"  3. Tablo playlist/video: FAILED: {e}")
+        if not _sh.which("ffprobe") or not _sh.which("ffmpeg"):
+            say("  ffmpeg/ffprobe not installed: can't check further.")
+            return
+        say("  5. Broadcast: " + streams(url))
+        enc = choose_encoder()
+        job = LiveJob(ch.identifier, 720, ch.display_name, "", folder, None, enc, url=url, height=720)
+        cmd = LiveTV._cmd(job)
+        cmd = cmd[:cmd.index("-f", cmd.index("-ac"))] + ["-t", "20"] + cmd[cmd.index("-f", cmd.index("-ac")):]
+        t1 = time.time()
+        r = subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=90)
+        took = time.time() - t1
+        made = sorted(folder.glob("seg*.ts"))
+        say(f"  6. Test conversion ({ENCODERS[enc]['label']}): {len(made)} segments for 20 s of TV in "
+            f"{took:.0f} s (ffmpeg exit {r.returncode})" + (" – slower than real time!" if took > 30 else ""))
+        for line in [l for l in r.stderr.splitlines() if l.strip()][-4:]:
+            say(f"     ffmpeg: {line.strip()[:160]}")
+        if made:
+            say("  7. Converted video: " + streams(made[0], timeout=30))
+            b = subprocess.run(["ffmpeg", "-hide_banner", "-nostdin", "-i", str(made[len(made) // 2]), "-vf",
+                                "blackdetect=d=0.5:pix_th=0.1", "-an", "-f", "null", "-"],
+                               capture_output=True, text=True, timeout=60)
+            black = "black_start" in b.stderr
+            decoded = "frame=" in b.stderr or "Output #0" in b.stderr
+            say("  8. Picture: " + ("BLACK (the conversion makes a black picture)" if black
+                                    else "not black" if decoded else "couldn't decode a segment on its own!"))
+            # A browser joins a live stream mid-way, so every segment must start with the
+            # stream headers (SPS/PPS) and a keyframe, or the picture stays black.
+            later = made[-2] if len(made) > 1 else made[0]
+            h = subprocess.run(["ffmpeg", "-hide_banner", "-nostdin", "-i", str(later), "-map", "0:v:0", "-c:v", "copy",
+                                "-bsf:v", "trace_headers", "-frames:v", "1", "-f", "null", "-"],
+                               capture_output=True, text=True, timeout=60)
+            ok = "Sequence Parameter Set" in h.stderr and "= 5" in h.stderr
+            say("     Segments start cleanly (headers + keyframe), so a player can join mid-stream: "
+                + ("yes" if ok else "NO – a browser joining mid-stream would show nothing"))
+    finally:
+        tablo.end_session(token)
+        shutil.rmtree(folder, ignore_errors=True)
+        say(f"Done; tuner freed. These lines are also in {LOG_FILE.name}.")
+        for line in out:
+            log.debug(f"diagnose: {line}")
+
+
+def simulate_players(tablo, favs, chans, seconds: int = 30) -> list:
+    """--diagnose step 9: play channels through this script exactly the way the phone /
+    multi-view page does (each in its own slot, started one after another), with a
+    stand-in player instead of a browser: fetch the playlist, download each new segment,
+    re-check every 2 s. Reports, per channel, how long the first video took, how much
+    arrived, and the longest wait for new video. Returns the report lines."""
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    server = start_server(tablo, favs, port, lan=False)
+    results = {}
+
+    def player(slot, ch, started_evt):
+        r = results[slot] = {"ch": ch, "first": None, "segs": 0, "bytes": 0, "gap": 0.0, "errors": []}
+        base = f"http://127.0.0.1:{port}/live/{urllib.parse.quote(ch.identifier)}/"
+        t0 = time.time()
+        got, last_new = set(), None
+        try:
+            while time.time() - t0 < seconds + 30:
+                try:
+                    with urllib.request.urlopen(f"{base}index.m3u8?slot={slot}", timeout=35) as resp:
+                        text = resp.read().decode()
+                except urllib.error.HTTPError as e:
+                    r["errors"].append(f"playlist: HTTP {e.code} {e.read()[:60].decode(errors='replace')}")
+                    time.sleep(2)
+                    continue
+                if r["first"] is None:
+                    r["first"] = time.time() - t0
+                    started_evt.set()
+                for name in [l.strip() for l in text.splitlines() if l.strip() and not l.startswith("#")]:
+                    if name in got:
+                        continue
+                    got.add(name)
+                    try:
+                        with urllib.request.urlopen(base + name, timeout=15) as seg:
+                            r["bytes"] += len(seg.read())
+                        r["segs"] += 1
+                        now = time.time()
+                        if last_new:
+                            r["gap"] = max(r["gap"], now - last_new)
+                        last_new = now
+                    except Exception as e:
+                        r["errors"].append(f"segment: {e}")
+                if r["first"] is not None and time.time() - t0 - r["first"] > seconds:
+                    break
+                time.sleep(2)
+        finally:
+            started_evt.set()
+
+    threads = []
+    try:
+        for slot, ch in enumerate(chans, 1):
+            evt = threading.Event()
+            t = threading.Thread(target=player, args=(slot, ch, evt), daemon=True)
+            t.start()
+            threads.append(t)
+            evt.wait(timeout=45)           # one after another, like the multi-view page
+        for t in threads:
+            t.join(timeout=seconds + 90)
+    finally:
+        try:
+            server.RequestHandlerClass.end_all_sessions()
+        except Exception:
+            pass
+        server.shutdown()
+        server.server_close()
+    lines = []
+    for slot in sorted(results):
+        r = results[slot]
+        name = r["ch"].display_name
+        if r["first"] is None:
+            lines.append(f"     {name}: NO VIDEO" + (f" ({r['errors'][-1]})" if r["errors"] else ""))
+            continue
+        tv_secs = r["segs"] * 2
+        lines.append(f"     {name}: first video after {r['first']:.0f} s; {r['segs']} segments "
+                     f"(~{tv_secs} s of TV, {r['bytes'] // 1024} KB) in ~{seconds} s; longest wait for new "
+                     f"video {r['gap']:.0f} s" + (f"; {len(r['errors'])} errors, last: {r['errors'][-1]}" if r["errors"] else ""))
+        if tv_secs < seconds * 0.6:
+            lines.append(f"       ^ too little video: a browser would stall or stay black on {name}")
+    return lines
 
 
 def print_recent(tablo) -> None:
@@ -3712,6 +4271,9 @@ def build_parser() -> argparse.ArgumentParser:
                     help=f"VLC buffer in milliseconds for this run (default from tablo.ini or "
                          f"{DEFAULT_VLC_BUFFER}); try 10000 if Wi-Fi hiccups cause stutters")
     ap.add_argument("--vlc", action="store_true", help="shortcut for --player vlc")
+    ap.add_argument("--diagnose", metavar="CH", nargs="+",
+                    help="check a channel's path from the Tablo to a browser, step by step; give two or more "
+                         "(--diagnose 2.1 11.1) to also test them at the same time, like multi-view")
     ap.add_argument("--tune", metavar="CH", help="print a one-time VLC command for the Tablo's raw stream")
     ap.add_argument("--vlc-commands", action="store_true",
                     help="print a VLC command per local channel (script must be running)")
@@ -3858,6 +4420,21 @@ def run_one_shot(args, tablo, favs, port) -> bool:
         return True
     if args.list:
         print_channels(tablo, favs, show_streaming=True)
+        return True
+    if args.diagnose:
+        chans = []
+        for want in args.diagnose[:4]:
+            ch = resolve(tablo, favs, want)
+            if not ch:
+                sys.exit(f"'{want}' not found. Run --list to see channels.")
+            chans.append(ch)
+        cmd_diagnose(tablo, chans[0])
+        print(f"  9. Playing {len(chans)} channel{'s' if len(chans) > 1 else ''} through this script the way "
+              f"the browser page does (about a minute)...")
+        lines = simulate_players(tablo, favs, chans)
+        for line in lines:
+            print(line)
+            log.debug(f"diagnose: {line.strip()}")
         return True
     if args.search:
         print_search(tablo, favs, args.search)
