@@ -212,7 +212,7 @@ from pathlib import Path
 # SECTION 1: PLATFORM HELPERS
 # Small differences between Linux and Windows, kept in one place.
 # =============================================================================
-__version__ = "1.2.0"        # shown by --version and at the top of the log
+__version__ = "1.3.0"        # shown by --version and at the top of the log
 
 IS_WINDOWS = os.name == "nt"
 # How to run this script, for help text: Windows uses the py launcher.
@@ -275,6 +275,7 @@ class Settings:
         self.use_ffmpeg = False          # ffmpeg can relay streams to VLC (--direct turns off)
         self.player = None               # chosen video player: resolve_player()
         self.last_ffplay = None          # ffplay window we opened (closed when switching)
+        self.last_ffplay2 = None         # ... and the second window (menu: w 4.1)
         self.vlc_buffer_ms = DEFAULT_VLC_BUFFER   # VLC live buffer, ms (tablo.ini vlc_buffer, --buffer)
         self.deinterlace = "yadif2x"     # VLC deinterlace mode; "off" = none
         self.browser_quality = 720       # phones/tablets picture height (browser_quality)
@@ -1697,6 +1698,8 @@ button{background:var(--acc);color:#fff;border:0;border-radius:8px;padding:10px 
 .asof{color:var(--mute);font-size:13px} button:disabled{opacity:.6}
 .top{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin:0 0 4px}
 .top h1{margin:0} .gbar{display:flex;align-items:center;gap:10px;margin-left:auto}
+.mv{font-size:14px;margin-right:6px} .gbar{flex-wrap:wrap;justify-content:flex-end}
+.mv,.asof,#gref{white-space:nowrap}
 #gref{padding:8px 14px;font-size:14px}
 .saved{color:var(--acc)} .warn{border:1px solid var(--acc);border-radius:8px;padding:8px 12px;margin:8px 0;color:var(--fg)} .small{font-size:13px;margin-top:8px}
 </style></head><body>
@@ -1704,7 +1707,7 @@ button{background:var(--acc);color:#fff;border:0;border-radius:8px;padding:10px 
 <google-cast-launcher id="castbtn" style="display:none;width:30px;height:30px;--connected-color:#e8590c;cursor:pointer"></google-cast-launcher>
 <button id="pclose" type="button">Close</button></div><video id="video" controls playsinline autoplay x-webkit-airplay="allow"></video></div>
 <div class="top"><h1>Tablo Channels</h1>
-<div class="gbar"><span class="asof" id="asof">%%ASOF%%</span><button type="button" id="gref">↻ Refresh guide</button></div></div>
+<div class="gbar">%%MULTI_LINK%%<span class="asof" id="asof">%%ASOF%%</span><button type="button" id="gref">↻ Refresh guide</button></div></div>
 <p>Click Play to watch. Hover over a show for its description. Favorites come from the <b>favorites</b> line in tablo.ini.</p>
 <div id="chans">
 <h2>Favorites</h2>%%MISSING%%%%FAV%%
@@ -2012,6 +2015,133 @@ if (want) { const a = document.querySelector('a.play[data-id="' + CSS.escape(wan
 """
 
 
+# ----------------------------------------------------------------------
+# Multi-view page (/multi): 2 or 4 live channels at once in a browser (PC, tablet,
+# phone). Each player is its own converter + Tablo tuner; one has sound at a time.
+# ----------------------------------------------------------------------
+MULTI_PAGE = r"""<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Tablo Multi-view</title>
+<style>
+:root{--bg:#fff;--fg:#1a1a1a;--mute:#666;--line:#e3e3e3;--acc:#e8590c;--tile:#f3f3f3}
+@media (prefers-color-scheme:dark){:root{--bg:#16181c;--fg:#eee;--mute:#9a9a9a;--line:#2c2f36;--tile:#1f2228}}
+body{background:var(--bg);color:var(--fg);font:15px/1.4 system-ui,sans-serif;margin:0;padding:12px}
+.top{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:0 0 10px}
+h1{font-size:19px;margin:0 auto 0 0} a{color:var(--acc);text-decoration:none}
+button{background:var(--tile);color:var(--fg);border:1px solid var(--line);border-radius:8px;padding:7px 12px;font-size:14px;cursor:pointer}
+button.sel{background:var(--acc);border-color:var(--acc);color:#fff}
+#grid{display:grid;gap:10px;grid-template-columns:1fr 1fr}
+#grid:fullscreen{background:#000;padding:8px;gap:8px;align-content:center}
+@media (max-width:700px) and (orientation:portrait){#grid.g2{grid-template-columns:1fr}}
+.tile{background:var(--tile);border:3px solid transparent;border-radius:10px;padding:6px;min-width:0;display:flex;flex-direction:column;gap:6px}
+.tile.on{border-color:var(--acc)}
+.bar{display:flex;align-items:center;gap:8px} select{flex:1;min-width:0;font-size:14px;padding:5px;border-radius:6px;
+  background:var(--bg);color:var(--fg);border:1px solid var(--line)}
+.snd{font-size:13px;color:var(--mute);white-space:nowrap;cursor:pointer}
+.tile.on .snd{color:var(--acc);font-weight:600}
+.vid{position:relative} video{width:100%;aspect-ratio:16/9;background:#000;border-radius:6px;display:block;cursor:pointer}
+.st{position:absolute;left:8px;bottom:8px;color:#fff;font-size:13px;background:rgba(0,0,0,.55);padding:2px 8px;border-radius:5px}
+.st:empty{display:none} .note{color:var(--mute);font-size:13px;margin-top:10px}
+</style></head><body>
+<div class="top"><h1>Multi-view</h1>
+<button id="n2" type="button">2 channels</button><button id="n4" type="button">4 channels</button>
+<button id="fs" type="button">⛶ Full screen</button><a href="/">Channel list</a></div>
+<div id="grid"></div>
+<p class="note">Tap a picture to hear it (one channel has sound at a time). Each channel uses one of your Tablo's
+tuners, so 2 channels need 2 free tuners and 4 need 4. They stop about a minute after you close this page.</p>
+<script src="/hls.min.js"></script>
+<script>
+const CH = %%CHANNELS%%, KEY = %%KEY%%;
+const grid = document.getElementById("grid");
+let n = 2, audio = 0, tiles = [], picks = [];
+try { const s = JSON.parse(localStorage.getItem("tablo-multi") || "{}"); n = s.n === 4 ? 4 : 2; picks = s.picks || []; } catch (e) {}
+const q = new URLSearchParams(location.search);
+if (q.get("n") === "4") n = 4; if (q.get("ch")) picks = q.get("ch").split(",");
+function save() { try { localStorage.setItem("tablo-multi", JSON.stringify({n: n, picks: picks})); } catch (e) {} }
+function src(id, slot) {             // 4 at once: smaller pictures (540p) to keep the PC's work down
+  return "/live/" + encodeURIComponent(id) + (n > 2 ? "/540" : "") + "/index.m3u8?slot=" + slot
+         + (KEY ? "&key=" + encodeURIComponent(KEY) : "");
+}
+function options(sel) {
+  let group = null, og = null;
+  sel.add(new Option("— pick a channel —", ""));
+  for (const c of CH) {
+    if (c.group !== group) { group = c.group; og = document.createElement("optgroup"); og.label = group; sel.appendChild(og); }
+    og.appendChild(new Option(c.label + (c.show ? " · " + c.show : ""), c.id));
+  }
+}
+function stopTile(t) { if (t.hls) { t.hls.destroy(); t.hls = null; } t.v.pause(); t.v.removeAttribute("src"); t.v.load(); }
+function load(i) {
+  const t = tiles[i]; stopTile(t); picks[i] = t.sel.value; save();
+  if (!t.sel.value) { t.st.textContent = ""; return; }
+  t.st.textContent = "Tuning…";
+  const url = src(t.sel.value, i + 1);
+  if (t.v.canPlayType("application/vnd.apple.mpegurl")) t.v.src = url;
+  else if (window.Hls && Hls.isSupported()) {
+    t.hls = new Hls({liveSyncDurationCount: 3, manifestLoadingMaxRetry: 6, manifestLoadingRetryDelay: 1500});
+    t.hls.on(Hls.Events.ERROR, (e, d) => { if (d.fatal) t.st.textContent = "Error (" + d.details + ") – all tuners busy?"; });
+    t.hls.loadSource(url); t.hls.attachMedia(t.v);
+  } else { t.st.textContent = "This browser can't play live video."; return; }
+  t.v.muted = i !== audio; t.v.play().catch(() => {});
+}
+function setAudio(i) {
+  audio = i;
+  tiles.forEach((t, j) => { t.v.muted = j !== i; t.el.classList.toggle("on", j === i);
+                            t.snd.textContent = j === i ? "🔊 sound" : "🔇 tap for sound"; });
+  tiles[i].v.play().catch(() => {});
+}
+function build() {
+  tiles.forEach(stopTile); grid.innerHTML = ""; tiles = [];
+  grid.className = "g" + n;
+  document.getElementById("n2").classList.toggle("sel", n === 2);
+  document.getElementById("n4").classList.toggle("sel", n === 4);
+  const defaults = CH.map(c => c.id);
+  for (let i = 0; i < n; i++) {
+    const el = document.createElement("div"); el.className = "tile";
+    el.innerHTML = '<div class="bar"><select></select><span class="snd"></span></div>'
+                 + '<div class="vid"><video playsinline muted autoplay x-webkit-airplay="allow"></video><span class="st"></span></div>';
+    grid.appendChild(el);
+    const t = {el: el, sel: el.querySelector("select"), v: el.querySelector("video"), st: el.querySelector(".st"),
+               snd: el.querySelector(".snd"), hls: null};
+    options(t.sel);
+    const want = picks[i] && CH.some(c => c.id === picks[i]) ? picks[i]
+               : defaults.find(id => !picks.slice(0, i).includes(id) && !tiles.some(x => x.sel.value === id)) || "";
+    t.sel.value = want;
+    t.sel.onchange = () => load(tiles.indexOf(t));
+    t.v.onclick = t.snd.onclick = () => setAudio(tiles.indexOf(t));
+    t.v.addEventListener("playing", () => t.st.textContent = "");
+    t.v.addEventListener("waiting", () => t.st.textContent = "Buffering…");
+    tiles.push(t);
+  }
+  tiles.forEach((t, i) => load(i));
+  setAudio(Math.min(audio, n - 1));
+}
+document.getElementById("n2").onclick = () => { n = 2; save(); build(); };
+document.getElementById("n4").onclick = () => { n = 4; save(); build(); };
+document.getElementById("fs").onclick = () => {
+  const f = grid.requestFullscreen || grid.webkitRequestFullscreen; if (f) f.call(grid);
+};
+build();
+</script></body></html>"""
+
+
+def render_multi_page(tablo, favs) -> bytes:
+    """/multi: the multi-view page, with every channel (favorites first) in each picker."""
+    now = tablo.now_playing()
+    chans = []
+    for group, cs in ordered(tablo, favs):
+        if group.startswith("FAST") and tablo.lan_only:
+            continue
+        for c in cs:
+            a = now.get(c.identifier)
+            chans.append({"id": c.identifier, "group": group,
+                          "label": (f"{c.major}.{c.minor} " if c.major else "") + c.call_sign,
+                          "show": a["show"] if a else ""})
+    # json.dumps output is safe inside <script> once "</" is escaped
+    data = json.dumps(chans).replace("</", "<\\/")
+    return fill(MULTI_PAGE, CHANNELS=data, KEY=json.dumps(S.access_key)).encode()
+
+
 def render_page(tablo: Tablo, favs: Favorites) -> bytes:
     """The main web page: channel list with Play buttons, the inline browser
     player (phones/tablets), Cast/AirPlay support and links for other devices."""
@@ -2064,6 +2194,7 @@ def render_page(tablo: Tablo, favs: Favorites) -> bytes:
     return fill(PAGE,
         SCRIPT=PAGE_SCRIPT, PLAYER_NOTE=note, TABLO_CFG=cfg, CAST_TAG=cast_tag,
         ASOF=f"Guide as of {tablo.guide_time()}" if tablo.guide_time() else "",
+        MULTI_LINK='<a href="/multi" class="mv">▦ Multi-view</a>' if LiveTV.available() else "",
         MISSING=missing,
         FAV=section(favs.channels(), "None set. Add e.g. <code>favorites = 4.1, 9.1</code> to tablo.ini."),
         OTA=section(favs.others(tablo.ota), "None found."),
@@ -2095,6 +2226,10 @@ def make_handler(tablo: Tablo, favs: Favorites, port: int):
         def from_this_pc(self) -> bool:
             """Request came from this computer itself (always trusted)."""
             return self.client_address[0] in ("127.0.0.1", "::1")
+
+        def query_value(self, name: str) -> str:
+            """One ?name=value from the request's address ('' if absent)."""
+            return (urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query).get(name) or [""])[0]
 
         def given_key(self) -> str:
             """Key from ?key=… or from the tablo_key cookie set on an earlier visit."""
@@ -2160,6 +2295,10 @@ def make_handler(tablo: Tablo, favs: Favorites, port: int):
                 host = self.headers.get("Host", f"127.0.0.1:{port}")
                 return self.send_body(tv_m3u(tablo, favs, host, path == "/tv-favorites.m3u"),
                                       "audio/x-mpegurl", cors=True)
+            if path in ("/multi", "/multi/"):
+                if not LiveTV.available():
+                    return self.send_body(b"Install ffmpeg on the PC for multi-view.", "text/plain", 501)
+                return self.send_body(render_multi_page(tablo, favs), "text/html; charset=utf-8")
             if path in ("/tv", "/tv/"):
                 return self.send_body(render_tv_page(tablo, favs), "text/html; charset=utf-8")
             if path == "/guide.xml":
@@ -2186,7 +2325,12 @@ def make_handler(tablo: Tablo, favs: Favorites, port: int):
                 return self.send_error(404, "Unknown channel")
             if not LiveTV.available():
                 return self.send_body(b"Install ffmpeg on the PC to watch in a browser.", "text/plain", 501)
-            viewer = self.client_address[0]
+            # Multi-view: each player on the /multi page adds ?slot=N, so one device can
+            # watch several channels at once (otherwise starting a channel on a device
+            # frees whatever that device was watching before).
+            slot = self.query_value("slot")
+            slot = slot if slot.isdigit() and 1 <= int(slot) <= 4 else ""
+            viewer = self.client_address[0] + (f"#{slot}" if slot else "")
             # A player first asks for index.m3u8 (the list of segments), then fetches
             # each segNNNNN.ts it lists, and re-asks for index.m3u8 every few seconds
             # to learn about new ones. Each request also says "this viewer is still here".
@@ -2210,8 +2354,11 @@ def make_handler(tablo: Tablo, favs: Favorites, port: int):
                 else:
                     return self.send_body(b"Still starting; try again", "text/plain", 503)
                 body = playlist.read_bytes()
-                if S.access_key:     # players don't send cookies for segments: add ?key= to each
-                    body = re.sub(rb"(?m)^(seg\d+\.ts)$", lambda m: m.group(1) + kq().encode(), body)
+                # Players don't send cookies for segments, and the slot must come along
+                # too: add ?key=…&slot=N to each segment line.
+                extra = "&".join(x for x in (kq(""), f"slot={slot}" if slot else "") if x)
+                if extra:
+                    body = re.sub(rb"(?m)^(seg\d+\.ts)$", lambda m: m.group(1) + b"?" + extra.encode(), body)
                 return self.send_body(body, "application/vnd.apple.mpegurl", cors=True)
             name = name.split("?")[0]
             if re.fullmatch(r"seg\d+\.ts", name):
@@ -2305,15 +2452,20 @@ def make_handler(tablo: Tablo, favs: Favorites, port: int):
             ch = tablo.by_id(ident)
             if not ch:
                 return self.send_error(404, "Unknown channel")
-            viewer = self.client_address[0]
+            # ?w=2 = the menu's second player window: its own tuner, so it doesn't
+            # replace what the first window is showing.
+            win = self.query_value("w")
+            win = win if win in ("2",) else ""
+            viewer = self.client_address[0] + (f"#w{win}" if win else "")
             # Switching channels on the same device: free the old tuner first.
             with sessions_lock:
                 old = sessions.pop(viewer, "")
             if old:
                 tablo.end_session(old)
             try:
-                url, token = tablo.watch_session(
-                    ident, who="VLC on this PC" if viewer in ("127.0.0.1", "::1") else f"VLC on {viewer}")
+                here = self.client_address[0] in ("127.0.0.1", "::1")
+                who = ("player window 2" if win else "VLC") + (" on this PC" if here else f" on {self.client_address[0]}")
+                url, token = tablo.watch_session(ident, who=who)
             except Exception as e:
                 log.error(f"[{ch.display_name}] could not tune: {e}.{tablo.busy_hint()}")
                 return self.send_error(503, "Tablo could not tune (all tuners busy?)")
@@ -2581,13 +2733,16 @@ class VLCControl:
         return True
 
 
-VLC = VLCControl()
+VLC = VLCControl()          # the menu's player window
+VLC2 = VLCControl()         # the second window (menu: w 4.1), for two channels at once
 
 
-def launch_player(url: str, meta: dict | None = None, playlist: bool = False, detach: bool = False) -> bool:
+def launch_player(url: str, meta: dict | None = None, playlist: bool = False, detach: bool = False,
+                  window: int = 1) -> bool:
     """Open url in the chosen player. meta = guide info (title/description).
     VLC: one window, channel replaced on each pick. ffplay: old window closed first.
-    detach=True (--play): a plain VLC launch that outlives the script."""
+    detach=True (--play): a plain VLC launch that outlives the script.
+    window=2: the menu's second window (w 4.1), so two channels play side by side."""
     if not S.player:
         log.warning("No video player found. Install VLC (sudo apt install vlc, or "
                     "flatpak install flathub org.videolan.VLC) or ffmpeg, which includes ffplay "
@@ -2602,21 +2757,25 @@ def launch_player(url: str, meta: dict | None = None, playlist: bool = False, de
     if kind == "vlc":
         options = {**(meta or {}), **vlc_tuning()}
         if not detach:
-            return VLC.play(S.player["cmd"], url, options, title)
+            return (VLC2 if window == 2 else VLC).play(S.player["cmd"], url, options, title)
         cmd = [*S.player["cmd"], "--one-instance", url, *[f":{k}={v}" for k, v in options.items()]]
     elif kind == "ffplay":
         cmd = [*S.player["cmd"], "-hide_banner", "-loglevel", "error",
                "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "10",
                "-window_title", title or "Tablo", url]
-        if S.last_ffplay and S.last_ffplay.poll() is None:
-            S.last_ffplay.terminate()   # one window at a time, like VLC
+        last = S.last_ffplay2 if window == 2 else S.last_ffplay
+        if last and last.poll() is None:
+            last.terminate()            # one window per slot, like VLC
     elif kind == "mpv":
         cmd = [*S.player["cmd"], *([f"--force-media-title={title}"] if title else []), url]
     else:
         cmd = [*S.player["cmd"], url]
     proc = spawn(cmd)
     if kind == "ffplay":
-        S.last_ffplay = proc
+        if window == 2:
+            S.last_ffplay2 = proc
+        else:
+            S.last_ffplay = proc
     return True
 
 
@@ -2638,8 +2797,9 @@ def shutdown(server) -> None:
         server.RequestHandlerClass.end_all_sessions()
     except Exception as e:
         log.debug(f"Ending sessions: {e}")
-    if VLC.proc and VLC.proc.poll() is None:
-        VLC.proc.terminate()
+    for player in (VLC, VLC2):
+        if player.proc and player.proc.poll() is None:
+            player.proc.terminate()
     server.shutdown()
     log.info("Stopped.")
 
@@ -3014,6 +3174,7 @@ def menu(tablo, favs, port, web):
     help_line = ("\nType a number or channel (9.1, KFOR) to watch.  p = previous channel  i3 = details\n"
                  "/football = search the guide  +3 / -3 = add/remove favorite  r = refresh guide  "
                  "t = tuners\n"
+                 "w 4.1 = 2nd window (two channels at once; w off closes it)  m = multi-view page\n"
                  "f=favorites  a=all  s=show/hide FAST  l=list" + ("  w=web page" if web else "")
                  + "  q=quit    Keep this window open while watching.")
     watched_now = None                     # channel watched in this session (for 'p')
@@ -3081,6 +3242,40 @@ def menu(tablo, favs, port, web):
             open_url(base + "/")
             print(f"Opening {base}/")
             continue
+        if c[0] == "w" and len(c) > 1 and (c[1] == " " or c[1].isdigit()):   # w 4.1: second window
+            arg = choice[1:].strip()
+            if arg.lower() in ("off", "close", "x"):
+                closed = False
+                for proc in (VLC2.proc, S.last_ffplay2):
+                    if proc and proc.poll() is None:
+                        proc.terminate()
+                        closed = True
+                print("Closed the second window." if closed else "No second window is open.")
+                continue
+            ch = resolve(tablo, favs, arg, numbered)
+            if not ch:
+                print(f"'{arg}' not found. Type l to list channels.")
+                continue
+            if ch.kind != "ota" and not tablo.maybe_reconnect(min_gap=15):
+                print("FAST (online) channels need the internet. Local channels still work.")
+                continue
+            print(f"Tuning {ch.display_name} in a second window (uses another tuner)...")
+            shown = getattr(tablo, "shown_now", {}) or {}
+            if launch_player(f"{base}/ch/{ch.identifier}?w=2", vlc_meta(ch, shown.get(ch.identifier)), window=2):
+                print(f"Playing {ch.display_name} in window 2. Type w off to close it.")
+            continue
+        if c in ("m", "multi"):                               # multi-view page in the browser
+            if not LiveTV.available():
+                print("Multi-view needs ffmpeg on this PC (sudo apt install ffmpeg).")
+                continue
+            open_url(base + "/multi")
+            print(color_addresses(f"Opening multi-view: {base}/multi"))
+            if S.lan_base:                                   # started with --lan
+                print(color_addresses(f"Other devices on your Wi-Fi: open {S.lan_base}/multi{kq()}"))
+            else:
+                print(color_addresses(f"For other devices on your Wi-Fi, restart with --lan, then open "
+                                      f"http://{lan_ip(tablo.device_url)}:{port}/multi"))
+            continue
         if c[0] == "i" and len(c) > 1 and (c[1:].strip()[:1].isdigit() or c[1] == " "):
             ch = resolve(tablo, favs, choice[1:].strip(), numbered)
             show_info(tablo, ch) if ch else print(f"'{choice[1:].strip()}' not found.")
@@ -3120,6 +3315,8 @@ examples:
   {RUN} --offline               home network only, no internet
   {RUN} --refresh-guide         refresh the guide in the copy that's already running
   {RUN} --search football       find a show (in the menu: /football; p = previous channel)
+  two channels at once          in the menu: w 4.1 (second window) or m (multi-view page,
+                                2 or 4 channels: http://127.0.0.1:8000/multi)
   {RUN} --max-channels          list only the first 50 channels (or --max-channels 30)
 
 computers that can run this script:
@@ -3713,6 +3910,7 @@ def announce(args, tablo, port) -> None:
                  + ("" if LiveTV.available() else "  (install ffmpeg on this PC for in-browser playback)"))
         if LiveTV.available():
             log.info(f"TVs (Fire TV Silk, Samsung Internet, Google TV browser): {S.lan_base}/tv{kq()}")
+            log.info(f"Multi-view, 2 or 4 channels at once (PC, tablet): {S.lan_base}/multi{kq()}")
             log.info(f"IPTV apps (TiviMate, UHF, iPlayTV, Kodi): playlist {S.lan_base}/tv.m3u{kq()}  "
                      f"guide {S.lan_base}/guide.xml{kq()}")
         if not S.access_key:

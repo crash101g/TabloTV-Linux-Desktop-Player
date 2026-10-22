@@ -96,6 +96,9 @@ WATCHING TV, THE TERMINAL WAY
     (--no-color turns colors off; the log file is always plain text.)
   * See what's on: current show, episode and time left for every channel.
     i3 shows the description and what's coming up next.
+  * Two channels at once: type w 4.1 to open a second player window next to
+    the first (w off closes it), or m for the multi-view page with 2 or 4
+    channels side by side in your browser (see "Multi-view" below).
   * Long channel list? --max-channels shows only the first 50 (or
     --max-channels 30, or max_channels = 50 in tablo.ini). Favorites always
     show, and you can still watch any hidden channel by typing its number
@@ -316,6 +319,19 @@ Once it worked on Linux, I kept going. The same single file now also covers:
       - Playlist:  http://192.168.1.20:8000/playlist.m3u
         (the original stream, not converted)
 
+  Multi-view: 2 or 4 channels at once
+    Open http://192.168.1.20:8000/multi on a PC or tablet (or type m in the
+    menu): two or four live channels side by side, each with its own
+    channel picker. Tap a picture to hear it; one has sound at a time.
+    Full screen fills the screen with all of them. Your picks are
+    remembered. On the desktop, w 4.1 in the menu opens a second VLC
+    window instead.
+      * Each channel uses its own Tablo tuner (2 channels = 2 tuners), so
+        on a 2-tuner Tablo nothing else can record while you watch two.
+      * Each channel is converted separately: 4 at once is heavy without a
+        graphics chip, so 4-up uses smaller pictures (540p).
+      * Not on the TV page: a Fire TV or TV browser is too slow for it.
+
   Run it headless (Linux server, container or VM)
     No desktop, screen or media player needed. If you're watching on another
     streaming-capable device (phone, tablet, TV, IPTV app), the script can run
@@ -415,11 +431,13 @@ Tested by me on a real Tablo 4th Gen:
   real Tablo broadcasts).
 
 Also tested in simulation (a mock Tablo, plus a real VLC where noted).
-53 of these checks ship as an automated test suite in tests/:
+59 of these checks ship as an automated test suite in tests/:
   Linux desktop
   * Menu, columns, colors, favorites; --play, --info, --list, --tune,
     --max-channels; p (previous channel), the Recent line, /search,
     tuner status (t) and the "tuners busy" message
+  * Two channels at once: second VLC window (w 4.1) with a real VLC: two
+    windows, each switching channels on its own, each keeping its tuner
   * Request signing against the Tablo's local tuning endpoint
   * Same-window channel switching in a real VLC
   * Buffer (3 s default, adjustable) and deinterlacing options passed to VLC
@@ -439,6 +457,9 @@ Also tested in simulation (a mock Tablo, plus a real VLC where noted).
   Bonus platforms
   * Windows code paths (checked on Linux)
   * Phone/TV conversion: 1080i MPEG-2 in, 720p/1080p H.264 + AAC out
+  * Multi-view page: 2 and 4 players, one device watching several channels
+    at once (each keeps its own converter and tuner), sound switching,
+    picks remembered
   * Closed captions: a broadcast-style stream with real CEA-608 captions
     keeps them after the conversion; captions on/off on the TV page
   * Phone page and TV page (with remote keys) in phone- and TV-size browsers
@@ -469,6 +490,8 @@ Not tested on real hardware (built and simulation-tested only):
   * Graphics-chip (hardware) encoding: the test machine had no GPU, so only
     the detection and the software fallback were tested
   * The system keyring on a real desktop (tested with a stand-in)
+  * Multi-view with real video on a real PC, tablet or phone (the test
+    browser can't decode H.264; the page, players and streams were checked)
   * Tuner status against a real Tablo: the tuner count, and whether the
     4th Gen reports busy tuners (if it does, recordings get counted too)
   * Closed captions shown on a real iPhone, Android phone or TV (the
