@@ -1,0 +1,27 @@
+# Start tablo-vlc's server automatically on Linux (systemd user service).
+#
+# 1. Edit the ExecStart line if tablo-vlc.py isn't in ~/tablo-vlc
+# 2. Copy this file:      mkdir -p ~/.config/systemd/user
+#                         cp tablo-vlc.service ~/.config/systemd/user/
+# 3. Turn it on:          systemctl --user daemon-reload
+#                         systemctl --user enable --now tablo-vlc
+# 4. Keep it running when you're logged out (and start it at boot):
+#                         sudo loginctl enable-linger $USER
+# See what it's doing:    journalctl --user -u tablo-vlc -f
+# Stop it / turn it off:  systemctl --user disable --now tablo-vlc
+#
+# Run ./tablo-vlc.py once by hand first, so tablo.ini has your Tablo login.
+
+[Unit]
+Description=tablo-vlc: Tablo live TV server for phones, tablets and TVs
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/bin/python3 %h/tablo-vlc/tablo-vlc.py --lan --no-vlc
+Environment=PYTHONUNBUFFERED=1
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=default.target

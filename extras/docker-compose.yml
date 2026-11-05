@@ -1,0 +1,20 @@
+# Run tablo-vlc as an always-on server.   From this extras/ folder:
+#   docker compose run --rm tablo-vlc --setup    (first time: enter your Tablo login)
+#   docker compose up -d                         (start; restarts after a reboot)
+#   docker compose logs -f                       (see the addresses to open on phones/TVs)
+services:
+  tablo-vlc:
+    build:
+      context: ..
+      dockerfile: extras/Dockerfile
+    image: tablo-vlc
+    container_name: tablo-vlc
+    # Host networking: phones and TVs can reach it, it can reach the Tablo, and the
+    # startup lines show this computer's real IP address.
+    network_mode: host
+    volumes:
+      - ./data:/data            # tablo.ini, tablo-cache.json and the log end up here
+    restart: unless-stopped
+    # Optional: let ffmpeg use an Intel/AMD graphics chip (VAAPI) for the conversion
+    # devices:
+    #   - /dev/dri:/dev/dri
