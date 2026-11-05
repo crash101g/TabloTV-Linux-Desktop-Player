@@ -1,0 +1,13 @@
+[Desktop Entry]
+# Adds "Tablo TV" to your Linux app menu (GNOME, COSMIC, KDE...). It opens the
+# channel menu in a terminal window.
+# 1. Change both /home/YOU/tablo-vlc paths below to where tablo-vlc.py is
+# 2. Copy this file to ~/.local/share/applications/
+Type=Application
+Name=Tablo TV
+Comment=Watch live TV from your Tablo (tablo-vlc)
+Exec=/home/YOU/tablo-vlc/tablo-vlc.py
+Path=/home/YOU/tablo-vlc
+Icon=video-display
+Terminal=true
+Categories=AudioVideo;Video;TV;

@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="tablo-vlc logo">
+<defs>
+<linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#1c2230"/><stop offset="1" stop-color="#0b0d12"/></linearGradient>
+<linearGradient id="or" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#ffa94d"/><stop offset="1" stop-color="#e8590c"/></linearGradient>
+<linearGradient id="sc" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#14304a"/><stop offset="1" stop-color="#0c1622"/></linearGradient>
+</defs>
+<rect width="512" height="512" rx="108" fill="url(#bg)"/>
+<rect x="6" y="6" width="500" height="500" rx="102" fill="none" stroke="#fff" stroke-opacity=".08" stroke-width="4"/>
+<g fill="none" stroke="#87d7ff" stroke-width="16" stroke-linecap="round">
+<path d="M218 92a52 52 0 0 1 76 0" opacity=".95"/><path d="M186 60a98 98 0 0 1 140 0" opacity=".5"/>
+</g>
+<g stroke="url(#or)" stroke-width="20" stroke-linecap="round"><path d="M256 190L206 124"/><path d="M256 190L306 124"/></g>
+<circle cx="256" cy="124" r="15" fill="#87d7ff"/>
+<rect x="84" y="182" width="344" height="256" rx="44" fill="url(#or)"/>
+<rect x="110" y="208" width="292" height="204" rx="24" fill="url(#sc)"/>
+<path d="M152 262l62 48-62 48" fill="none" stroke="#87d7ff" stroke-width="28" stroke-linecap="round" stroke-linejoin="round"/>
+<rect x="238" y="340" width="110" height="26" rx="13" fill="#ffa94d"/>
+</svg>

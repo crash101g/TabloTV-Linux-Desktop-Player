@@ -1,0 +1,11 @@
+# Your login, keys and local data: never commit these
+tablo.ini
+tablo-cache.json
+*.log
+*.log.*
+tablo-hls.min.js
+__pycache__/
+.pytest_cache/
+# Docker data folder (holds tablo.ini)
+data/
+extras/data/
