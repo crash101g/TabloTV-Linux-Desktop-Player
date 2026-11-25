@@ -33,6 +33,8 @@ Extras:
   --vlc-commands   print a VLC command per local channel (script must be running)
   --ffplay         play in ffplay instead of VLC (or --player mpv, --player vlc)
   --offline        LAN-only mode: no internet at all; local channels from the saved list
+  --devices        scan for the Tablos on your account and pick one (saved in tablo.ini)
+  --device NAME    use a particular Tablo for this run (name, number from --devices, or IP)
   --tablo-ip ADDR  your Tablo's address if it changed (e.g. 192.168.1.50)
   --direct         never use ffmpeg, even if it's installed
   --encoder NAME   phone/TV video encoder: auto (graphics chip if possible), x264, ...
@@ -212,7 +214,7 @@ from pathlib import Path
 # SECTION 1: PLATFORM HELPERS
 # Small differences between Linux and Windows, kept in one place.
 # =============================================================================
-__version__ = "1.5.4"        # shown by --version and at the top of the log
+__version__ = "1.6.0"        # shown by --version and at the top of the log
 
 IS_WINDOWS = os.name == "nt"
 # How to run this script, for help text: Windows uses the py launcher.
@@ -316,7 +318,7 @@ CONFIG_HEADER = """\
 #                      password in your desktop keyring instead (--setup offers it)
 #   favorites        : channels to list first, e.g. 4.1, 9.1, KFOR (or use --add-fav / --remove-fav)
 #   port             : local port for the playlist server
-#   device           : (optional) Tablo name, if your account has more than one
+#   device           : (optional) Tablo name, if your account has more than one (see --devices)
 #   vlc_buffer       : VLC buffer for live TV in milliseconds (default 3000 = 3 seconds).
 #                      If VLC stutters on Wi-Fi hiccups, try 10000 (10 seconds): smoother,
 #                      but channels take a few seconds longer to start and to change.
@@ -718,6 +720,70 @@ class Channel:
         return f"{self.major}.{self.minor} {self.call_sign}" if self.major else self.call_sign
 
 
+def cloud_account(email: str, password: str, timeout: int = 10, retries: int = 2):
+    """Log in to the Tablo cloud. Returns (access token, auth headers, account).
+    The account's 'devices' are your Tablo boxes; each 'url' is its home-network address."""
+    jhdr = {"User-Agent": CLOUD_UA, "Content-Type": "application/json"}
+    login = http("POST", f"{CLOUD}/api/v2/login/", jhdr,
+                 json.dumps({"email": email, "password": password}).encode(),
+                 timeout=timeout, retries=retries)
+    token = login["access_token"]
+    register_secret(token)
+    register_secret(password)
+    auth = {**jhdr, "Authorization": f"{login['token_type']} {token}"}
+    acct = http("GET", f"{CLOUD}/api/v2/account/", auth, timeout=timeout, retries=retries)
+    if not acct.get("devices"):
+        sys.exit("No Tablo devices found on this account.")
+    return token, auth, acct
+
+
+def device_reachable(url: str, timeout: float = 2) -> bool:
+    """Does a Tablo answer at this home-network address (http://ip:port)?"""
+    u = urllib.parse.urlsplit(url)
+    try:
+        socket.create_connection((u.hostname, u.port or 8885), timeout=timeout).close()
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def find_device(devices: list, wanted: str):
+    """The Tablo matching a name (any case), a number from --devices (1, 2...) or an
+    IP address, or None."""
+    w = wanted.strip().lower()
+    for d in devices:
+        if d["name"].lower() == w:
+            return d
+    if w.isdigit() and 1 <= int(w) <= len(devices):
+        return devices[int(w) - 1]
+    for d in devices:
+        if urllib.parse.urlsplit(d["url"]).hostname == w.split(":")[0]:
+            return d
+    return None
+
+
+def pick_device(devices: list, wanted: str = ""):
+    """Choose which Tablo to use: the one asked for (--device or tablo.ini device),
+    else, with several, the first that answers on the home network."""
+    if wanted:
+        dev = find_device(devices, wanted)
+        if dev:
+            return dev
+        if len(devices) == 1:
+            log.warning(f"No Tablo '{wanted}' on this account; using '{devices[0]['name']}'.")
+            return devices[0]
+    if len(devices) == 1:
+        return devices[0]
+    dev = next((d for d in devices if device_reachable(d["url"])), devices[0])
+    if wanted:
+        log.warning(f"No Tablo '{wanted}' on this account; using '{dev['name']}'. "
+                    f"Run --devices to see your Tablos.")
+    else:
+        log.info(f"Several Tablos on this account; using '{dev['name']}' "
+                 f"(choose one with --devices or --device NAME).")
+    return dev
+
+
 class Tablo:
     """Talks to the Tablo: the cloud (login, channel list, guide) and the box on
     your home network (tuning channels). Falls back to a saved channel list when
@@ -829,23 +895,13 @@ class Tablo:
         -> channel list. Updates everything in place and saves the cache."""
         jhdr = {"User-Agent": CLOUD_UA, "Content-Type": "application/json"}
         to, rt = self._timeout, self._retries
-        # Step 1: email + password -> access token (proves who you are)
-        login = http("POST", f"{CLOUD}/api/v2/login/", jhdr,
-                     json.dumps({"email": self.email, "password": self.password}).encode(),
-                     timeout=to, retries=rt)
-        self.access_token = login["access_token"]
-        register_secret(self.access_token)
-        register_secret(self.password)
-        auth = {**jhdr, "Authorization": f"{login['token_type']} {self.access_token}"}
-
-        # Step 2: the account -> your Tablo box(es); its 'url' is its home-network address
-        acct = http("GET", f"{CLOUD}/api/v2/account/", auth, timeout=to, retries=rt)
-        if not acct.get("devices"):
-            sys.exit("No Tablo devices found on this account.")
-        dev = acct["devices"][0]
-        if self.device_name:
-            dev = next((d for d in acct["devices"]
-                        if d["name"].lower() == self.device_name.lower()), dev)
+        # Steps 1-2: email + password -> access token -> the account and its Tablo box(es)
+        self.access_token, auth, acct = cloud_account(self.email, self.password, to, rt)
+        devices = acct["devices"]
+        if len(devices) > 1:
+            log.info("Tablos on this account: " + ", ".join(
+                f"'{d['name']}' ({d['url'].rstrip('/')})" for d in devices))
+        dev = pick_device(devices, self.device_name)
         self.device_url = dev["url"].rstrip("/")
 
         # Step 3: pick that box + your profile -> the "Lighthouse" token for guide requests
@@ -3872,6 +3928,7 @@ examples:
   {RUN} --web                   channel page in your browser
   {RUN} --lan                   share with phones, tablets and TVs
   {RUN} --offline               home network only, no internet
+  {RUN} --devices               more than one Tablo? list them and pick one
   {RUN} --refresh-guide         refresh the guide in the copy that's already running
   {RUN} --search football       find a show (in the menu: /football; p = previous channel)
   two channels at once          in the menu: w 4.1 (second window) or m (multi-view page,
@@ -4279,6 +4336,11 @@ def build_parser() -> argparse.ArgumentParser:
                     help="print a VLC command per local channel (script must be running)")
     ap.add_argument("--offline", "--local", dest="offline", action="store_true",
                     help="LAN-only mode: never use the internet; local channels from the saved list")
+    ap.add_argument("--devices", "--scan", dest="devices", nargs="?", const="", default=None, metavar="NAME",
+                    help="list the Tablos on your account, show which answer, and pick one to save "
+                         "in tablo.ini (or --devices NAME / number to save it directly)")
+    ap.add_argument("--device", metavar="NAME",
+                    help="use this Tablo for this run: its name, number from --devices, or IP")
     ap.add_argument("--tablo-ip", metavar="ADDR",
                     help="your Tablo's address, e.g. 192.168.1.50 (if it changed, or with --offline)")
     ap.add_argument("--direct", action="store_true", help="never use ffmpeg; VLC plays the Tablo stream itself")
@@ -4347,13 +4409,58 @@ def load_login(args):
                      f"(copy the values from tablo-api's tablo_api/auth.py on GitHub).")
         if args.fetch_keys:
             return None
+    if args.devices is not None:
+        cmd_devices(cfg, t, args.devices)
+        return None
     return cfg, t
+
+
+def cmd_devices(cfg, t, choose: str = "") -> None:
+    """--devices: list the Tablos on your account, check which answer on your home
+    network, and save your choice as device in tablo.ini (prompted, or --devices NAME)."""
+    try:
+        _, _, acct = cloud_account(t["email"], get_password(t))
+    except NetworkError as e:
+        sys.exit(f"Can't reach the Tablo cloud to list your Tablos: {e}")
+    devices = acct["devices"]
+    current = t.get("device", "").strip()
+    in_use = find_device(devices, current) if current else None
+    print(f"Tablos on your account ({len(devices)}), checking your home network...")
+    for i, d in enumerate(devices, 1):
+        url = d["url"].rstrip("/")
+        ok = device_reachable(url)
+        mark = "  <- tablo.ini device" if d is in_use else ""
+        print(color_addresses(f"  {i}. {d['name']:<20} {url:<28} "
+                              f"{'answers' if ok else 'NOT reachable'}{mark}"))
+    if current and not in_use:
+        print(f"tablo.ini has device = {current}, which isn't on this account.")
+    elif not current and len(devices) > 1:
+        print("tablo.ini has no device set: the first Tablo that answers is used.")
+    if not choose:
+        if len(devices) < 2 or not sys.stdin.isatty():
+            print("Choose one with: --devices NAME   (or --device NAME for one run)")
+            return
+        try:
+            choose = input("Number or name to save as your Tablo (Enter = keep as is): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return
+        if not choose:
+            return
+    dev = find_device(devices, choose)
+    if not dev:
+        sys.exit(f"No Tablo '{choose}' on this account.")
+    t["device"] = dev["name"]
+    save_config(cfg)
+    print(f"Saved device = {dev['name']} in {CONFIG_FILE.name}.")
+    if not device_reachable(dev["url"]):
+        print(f"Note: '{dev['name']}' doesn't answer at {dev['url'].rstrip('/')} right now.")
 
 
 def connect_tablo(args, t) -> "Tablo":
     """Step 3: log in to the Tablo cloud, or start from the saved channel list."""
     try:
-        return Tablo(t["email"], get_password(t), t.get("device", ""),
+        return Tablo(t["email"], get_password(t), args.device or t.get("device", ""),
                      lan_only=args.offline, tablo_ip=args.tablo_ip or "")
     except NetworkError as e:
         if args.offline:

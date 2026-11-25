@@ -161,6 +161,8 @@ KEEPS WORKING WHEN THINGS GO WRONG
   * --offline mode: home network only, zero internet traffic.
   * Retries brief hiccups and finds the Tablo again if its address changes
     (or set it with --tablo-ip).
+  * More than one Tablo? --devices lists them, shows which answer on your
+    network, and saves your pick; --device NAME uses one for a single run.
   * Logs back in on its own when the Tablo cloud login expires, so a box left
     running for days keeps its TV guide.
   * One device starting a channel never makes other devices' video stall.
