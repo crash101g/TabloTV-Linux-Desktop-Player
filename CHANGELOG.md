@@ -3,6 +3,19 @@
 Run `./tablo-vlc.py --version` to see which version you have. The version is
 also written at the top of `tablo-vlc.log` each time the script starts.
 
+## 1.6.0 (2026-11-24)
+
+- More than one Tablo on your account:
+  - `--devices` (or `--scan`) lists them, shows which answer on your home
+    network and which one tablo.ini uses, then asks which to save as `device`
+    in tablo.ini. `--devices NAME` (or its number) saves it without asking
+  - `--device NAME` uses one Tablo for a single run. NAME can be the Tablo's
+    name, its number from `--devices`, or its IP address
+  - With no `device` set, the first Tablo that answers on your network is used,
+    not just the first one the Tablo cloud lists (which may be switched off)
+  - A `device` name that isn't on the account is now logged as a warning, with
+    a pointer to `--devices`, instead of silently using another Tablo
+
 ## 1.5.4 (2026-10-22)
 
 - Fixed black pictures in multi-view (found with `/multi?debug` on a real PC):
